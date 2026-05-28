@@ -188,13 +188,19 @@ _OCR_PROMPT = """You are reading a steel coil identification number from a facto
 TASK: Find and read the spray-painted 10-digit coil ID number on the steel coil surface.
 
 RULES:
-1. The ID is ALWAYS exactly 10 digits (0-9 only). No letters, no symbols.
+1. The ID is exactly 10 digits (0-9). On the coil the 10 digits MAY be
+   immediately preceded or followed by a letter or short mark (a grade/suffix,
+   e.g. "A", "B", "X"). Read ONLY the 10 digits and IGNORE any such adjacent
+   letter. A leading/trailing letter is NOT a reason to say IMAGE_UNCLEAR.
 2. The digits are spray-painted in white/light color on the dark steel surface.
 3. The number may be curved (painted on round coil surface).
 4. IGNORE any stickers, labels, tags, or printed text. Read ONLY the spray-painted number.
 5. If a black plastic strap/band is covering any digits, respond with: STRAP_BLOCKED
-6. If the image is too blurry, dark, or at a bad angle to read digits, respond with: IMAGE_UNCLEAR
-7. If you can read all 10 digits clearly, respond with ONLY the 10 digits, nothing else.
+6. Only if the digits are GENUINELY unreadable (too blurry, dark, or angled),
+   respond with: IMAGE_UNCLEAR. Do NOT use IMAGE_UNCLEAR just because of an
+   extra letter or mark next to the number.
+7. If you can read all 10 digits, respond with ONLY the 10 digits, nothing else
+   (no letters, no spaces, no suffix).
 
 Respond with one of:
 - The 10 digits (e.g., 0226048954)
