@@ -1,0 +1,59 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Training run outputs
+runs_seg/
+runs/
+
+# Large data artifacts (not source code)
+data/colab_upload/*.zip
+data/effdb_dataset/
+data/fdb_dataset/
+data/yolo_seg_v2/
+data/labels_real_v2/
+data/recognizer_v2/train/
+data/recognizer_v2/val/
+data/recognizer_v2/labels.txt
+data/recognizer_v2/labels_full.txt
+data/visual_check*/
+data/detector_compare/
+data/rapid_smoke/
+
+# Logs
+*.log
+
+# Disabled / archived model checkpoints
+models/*.disabled
+models/*.bak
+
+# Screenshots (review aids, not source)
+web_review/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Runtime / secrets — never commit these
+.env
+data/uploads/
+data/inventory.json
+
+# Models — large files, not needed for Gemini pipeline
+models/*.pt
+models/*.pth
+
+# Large datasets — not needed on server
+dataset_images/
+data/training_strips/
+data/arc_results*/
+data/visual_results/
+data/arc_ocr_results/
+data/tesseract_results/
+data/prelabels*/
+data/fdb_dataset*/
+data/colab_upload/
+*.zip
+*.csv

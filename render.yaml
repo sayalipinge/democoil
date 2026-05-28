@@ -1,0 +1,27 @@
+# Render.com Blueprint — auto-deploys JSW Coil OCR
+# Docs: https://render.com/docs/blueprint-spec
+#
+# HOW TO USE (do this once, from any network that reaches render.com):
+#   1. Push this repo to GitHub (branch: deploy)
+#   2. render.com -> New -> Blueprint -> pick this repo -> branch "deploy"
+#   3. Render reads this file, builds the Dockerfile, deploys.
+#   4. In Render dashboard -> Environment -> add your Gemini key:
+#        GEMINI_API_KEY_1 = <your key from aistudio.google.com/apikey>
+#      (optional 2nd/3rd key for more free quota: GEMINI_API_KEY_2, _3)
+#   5. Workers open the https://jsw-coil-ocr.onrender.com URL on ANY phone/wifi.
+#
+# NOTE: free tier sleeps after 15 min idle -> first scan wakes it (~50s cold start).
+#       Upgrade to paid ($7/mo) later to keep it always-on. No code change needed.
+
+services:
+  - type: web
+    name: jsw-coil-ocr
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore        # closest Render region to India
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY_1
+        sync: false           # you set this secret in the Render dashboard
+      # PORT is injected automatically by Render — app.py reads it.
