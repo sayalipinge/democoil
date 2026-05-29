@@ -975,7 +975,7 @@ async function printLabel(count) {
         fields = data.fields || {};
     } catch(e) { /* offline / SAP off -> print ID + blank fields */ }
 
-    const v = k => (fields[k] !== undefined && fields[k] !== null && fields[k] !== '') ? fields[k] : '—';
+    const v = k => (fields[k] !== undefined && fields[k] !== null && fields[k] !== '') ? fields[k] : '-';
     const origin = window.location.origin;
 
     const oneLabel = () => `
@@ -1023,7 +1023,7 @@ async function printLabel(count) {
       </style>`;
 
     const win = window.open('', '_blank');
-    win.document.write('<html><head><title>JSW Coil Label</title>' + css + '</head><body>'
+    win.document.write('<html><head><meta charset="utf-8"><title>JSW Coil Label</title>' + css + '</head><body>'
         + labels
         + '<button class="noprint" onclick="window.print()" style="padding:10px 30px;font-size:16px;cursor:pointer;margin:10px 0;">Print</button>'
         + '</body></html>');
