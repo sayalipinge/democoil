@@ -115,14 +115,15 @@ SAP_ODATA_CSRF = True      # True  -> SAP Gateway / OData (fetches an X-CSRF-Tok
 #     Uncomment + set the ones your SAP returns; the rest stay blank.
 SAP_READ_ENDPOINT  = ""
 SAP_READ_FIELD_MAP = {
-    # label_field      : "SAP_JSON_KEY",
-    # "product"        : "ProductType",
+    # label_field      : "SAP_JSON_KEY",   (uncomment + set the ones SAP returns)
+    # "product"        : "ProductType",      # title, e.g. "HOT Rolled Coil"
+    # "cert_std"       : "CertifiedToStd",   # "Certified to Std", e.g. MS1768_2004
+    # "cert_no"        : "CertificationNo",  # "Certification No",  e.g. PC 012776
     # "grade"          : "Grade",
     # "size"           : "Size",
     # "heat_no"        : "HeatNo",
     # "net_weight"     : "NetWeight",
     # "quality"        : "Quality",
-    # "certification"  : "CertifiedToStd",
     # "customer"       : "CustomerName",
     # "so_no"          : "SoNumber",
     # "destination"    : "Destination",
@@ -130,6 +131,7 @@ SAP_READ_FIELD_MAP = {
     # "delivery_cond"  : "DeliveryCondition",
     # "insp_date"      : "InspDate",
     # "shipping_mark"  : "ShippingMark",
+    # "inspected_by"   : "InspectedBy",
 }
 
 app = FastAPI(title="JSW Coil OCR", version="3.0.0")
@@ -386,6 +388,18 @@ def barcode_svg(value: str):
     return Response(content=buf.getvalue(), media_type="image/svg+xml")
 
 
+# ── QR code (SVG) for the printed label ──────────────────────────────────────
+@app.get("/qrcode/{value}")
+def qrcode_svg(value: str):
+    """QR code of `value` as SVG (top-right of the printed coil label)."""
+    import io
+    import segno
+    safe = "".join(ch for ch in value if ch.isalnum())[:64] or "0"
+    buf  = io.BytesIO()
+    segno.make(safe, error="m").save(buf, kind="svg", scale=2, border=0)
+    return Response(content=buf.getvalue(), media_type="image/svg+xml")
+
+
 # ── Label data (coil ID + SAP fields, if read is configured) ─────────────────
 @app.get("/label_data")
 async def label_data(coil_id: str):
@@ -488,7 +502,7 @@ def index():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>JSW Coil OCR</title>
+<title>JSW COIL-ID SCANNER</title>
 
 <!-- PWA: makes app installable from Chrome on Android -->
 <link rel="manifest" href="/manifest.json">
@@ -570,7 +584,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 <body>
 
 <div class="header">
-  <h1>JSW Coil OCR</h1>
+  <h1>JSW COIL-ID SCANNER</h1>
   <div class="mode" id="modeLabel">Checking...</div>
 </div>
 
@@ -581,8 +595,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
     <video id="video" autoplay playsinline></video>
     <canvas id="canvas"></canvas>
     <button class="btn btn-capture" id="captureBtn" onclick="capture()">Capture Photo</button>
-    <button class="btn btn-upload" onclick="document.getElementById('fileInput').click()">Upload Image</button>
-    <input type="file" id="fileInput" accept="image/*" capture="environment" onchange="uploadFile(event)">
   </div>
 
   <!-- Loading -->
@@ -977,49 +989,91 @@ async function printLabel(count) {
 
     const v = k => (fields[k] !== undefined && fields[k] !== null && fields[k] !== '') ? fields[k] : '-';
     const origin = window.location.origin;
+    const batch  = (v('batch_no') !== '-') ? v('batch_no') : coilId;          // right barcode value
+    const prod   = (v('product')  !== '-') ? v('product')  : 'HOT Rolled Coil';
 
     const oneLabel = () => `
       <div class="lbl">
-        <div class="lbl-head">
-          <div class="made">MADE<br>IN<br>INDIA</div>
-          <div class="brand"><i>JSW</i> <span>Steel</span></div>
-          <div class="addr">Dolvi Works, Taluka - Pen, Dist - Raigad,<br>Maharashtra - 402107, India</div>
+        <!-- header band: MADE IN INDIA | MS/SIRIM | JSW + address | QR -->
+        <div class="hd">
+          <div class="hd-made">MADE<br>IN<br>INDIA</div>
+          <div class="hd-ms"><div class="ms-d">MS</div><div class="ms-s">SIRIM</div><div class="ms-pc">${v('cert_no')!=='-'?v('cert_no'):'PC 012776'}</div></div>
+          <div class="hd-jsw"><div class="jsw-lg"><i>JSW</i> Steel</div><div class="jsw-ad">Dolvi Works, Taluka - Pen, Dist - Raigad<br>Maharashtra - 402107, India</div></div>
+          <div class="hd-qr"><img src="${origin}/qrcode/${coilId}" alt="qr"></div>
         </div>
-        <div class="lbl-title">${v('product')==='—' ? 'HOT ROLLED COIL' : v('product')}</div>
-        <table class="lbl-tbl">
-          <tr><td class="k">Coil/Pack Number</td><td class="big" colspan="3">${coilId}</td></tr>
-          <tr><td class="k">Grade</td><td>${v('grade')}</td><td class="k">Heat No</td><td>${v('heat_no')}</td></tr>
-          <tr><td class="k">Size (mm)</td><td>${v('size')}</td><td class="k">Net Weight (MT)</td><td>${v('net_weight')}</td></tr>
-          <tr><td class="k">Quality</td><td>${v('quality')}</td><td class="k">Certified to Std</td><td>${v('certification')}</td></tr>
-          <tr><td class="k">Customer Name</td><td>${v('customer')}</td><td class="k">SO No.</td><td>${v('so_no')}</td></tr>
-          <tr><td class="k">Destination</td><td>${v('destination')}</td><td class="k">Batch Number</td><td>${v('batch_no')}</td></tr>
-          <tr><td class="k">Delivery Condition</td><td>${v('delivery_cond')}</td><td class="k">Insp. Date</td><td>${v('insp_date')}</td></tr>
-          <tr><td class="k">Shipping Mark</td><td colspan="3">${v('shipping_mark')}</td></tr>
-        </table>
-        <div class="lbl-bc"><img src="${origin}/barcode/${coilId}" alt="${coilId}"><div class="bc-num">${coilId}</div></div>
-        <div class="lbl-foot">Weighed on the Mill scale certified by the Weights and Measures Department.</div>
+        <div class="ttl">${prod}</div>
+        <!-- coil number + certified to std -->
+        <div class="bk b2">
+          <div class="cl"><div class="lb">Coil/Pack Number</div><div class="coil">${coilId}</div></div>
+          <div class="cl"><div class="lb">Certified to Std</div><div class="vl">${v('cert_std')}</div></div>
+        </div>
+        <!-- specs row 1 -->
+        <div class="bk b3">
+          <div class="cl"><div class="lb">Size (mm)</div><div class="vl">${v('size')}</div></div>
+          <div class="cl"><div class="lb">Heat No</div><div class="vl">${v('heat_no')}</div></div>
+          <div class="cl"><div class="lb">Grade</div><div class="vl">${v('grade')}</div></div>
+        </div>
+        <!-- specs row 2 -->
+        <div class="bk b3 dv">
+          <div class="cl"><div class="lb">Net Weight (MT)</div><div class="vl">${v('net_weight')}</div></div>
+          <div class="cl"><div class="lb">Quality</div><div class="vl">${v('quality')}</div></div>
+          <div class="cl"><div class="lb">Certification No</div><div class="vl">${v('cert_no')}</div></div>
+        </div>
+        <!-- customer row -->
+        <div class="bk b4">
+          <div class="cl"><div class="lb">Customer Name</div><div class="vl">${v('customer')}</div></div>
+          <div class="cl"><div class="lb">Delivery Condition</div><div class="vl">${v('delivery_cond')}</div></div>
+          <div class="cl"><div class="lb">SO No.</div><div class="vl">${v('so_no')}</div></div>
+          <div class="cl"><div class="lb">Insp. Date</div><div class="vl">${v('insp_date')}</div></div>
+        </div>
+        <!-- shipping row -->
+        <div class="bk b4">
+          <div class="cl"><div class="lb">Shipping Mark</div><div class="vl">${v('shipping_mark')}</div></div>
+          <div class="cl"><div class="lb">Destination</div><div class="vl">${v('destination')}</div></div>
+          <div class="cl"><div class="lb">Batch Number</div><div class="vl">${batch}</div></div>
+          <div class="cl"><div class="lb">Inspected By</div><div class="vl">${v('inspected_by')}</div></div>
+        </div>
+        <!-- two barcodes -->
+        <div class="bcs">
+          <div class="bc"><img src="${origin}/barcode/${coilId}" alt="${coilId}"><div class="bcn">${coilId}</div></div>
+          <div class="bc"><img src="${origin}/barcode/${batch}" alt="${batch}"><div class="bcn">${batch}</div></div>
+        </div>
+        <!-- weigh bridge footer -->
+        <div class="wb">
+          <div class="wb-h">WEIGH BRIDGE # IN</div>
+          <div class="wb-t">Weighed on the Mill scale certified by the Weights and Measures Department which is accepted for the Self Removal Procedure by Central Excise and/or Custom Dept and all the statutory purposes</div>
+        </div>
       </div>`;
 
     let labels = '';
     for (let i = 0; i < count; i++) labels += oneLabel();
 
     const css = `<style>
-        @media print { .noprint{display:none} @page{ margin:8mm } }
-        body{ font-family:Arial,sans-serif; padding:10px; }
-        .lbl{ border:2px solid #000; padding:10px 14px; margin:0 0 14px; width:480px; page-break-inside:avoid; }
-        .lbl-head{ display:flex; align-items:center; gap:10px; border-bottom:2px solid #000; padding-bottom:6px; }
-        .made{ font-size:8px; font-weight:bold; text-align:center; border:1px solid #000; padding:2px 4px; line-height:1.1; }
-        .brand{ font-size:26px; font-weight:bold; } .brand span{ font-size:13px; font-weight:normal; }
-        .addr{ font-size:9px; color:#222; margin-left:auto; text-align:right; }
-        .lbl-title{ text-align:center; font-weight:bold; font-size:13px; padding:5px 0; border-bottom:1px solid #000; }
-        .lbl-tbl{ width:100%; border-collapse:collapse; margin-top:4px; }
-        .lbl-tbl td{ border:1px solid #999; padding:3px 6px; font-size:11px; vertical-align:top; }
-        .lbl-tbl .k{ color:#444; font-size:9px; width:92px; }
-        .lbl-tbl .big{ font-size:20px; font-weight:bold; letter-spacing:2px; font-family:monospace; }
-        .lbl-bc{ text-align:center; margin-top:8px; }
-        .lbl-bc img{ height:46px; width:90%; }
-        .bc-num{ font-family:monospace; font-size:13px; letter-spacing:3px; }
-        .lbl-foot{ font-size:8px; color:#333; border-top:1px solid #000; margin-top:6px; padding-top:4px; }
+        @media print { .noprint{display:none} @page{ margin:6mm } }
+        body{ font-family:Arial,Helvetica,sans-serif; padding:8px; color:#000; }
+        .lbl{ border:2px solid #000; width:660px; margin:0 0 16px; page-break-inside:avoid; }
+        .hd{ display:flex; align-items:center; border-bottom:2px solid #000; }
+        .hd-made{ font-size:11px; font-weight:bold; text-align:center; border:2px solid #000; margin:6px; padding:4px 8px; line-height:1.15; }
+        .hd-ms{ text-align:center; padding:4px 6px; line-height:1.05; }
+        .ms-d{ display:inline-block; border:2px solid #000; font-weight:bold; font-size:15px; padding:1px 8px; }
+        .ms-s{ font-size:8px; } .ms-pc{ font-size:9px; }
+        .hd-jsw{ flex:1; text-align:center; }
+        .jsw-lg{ font-size:26px; font-weight:bold; } .jsw-lg i{ font-style:italic; }
+        .jsw-ad{ font-size:11px; }
+        .hd-qr{ padding:5px; } .hd-qr img{ width:62px; height:62px; }
+        .ttl{ text-align:center; font-weight:bold; font-size:16px; padding:3px 0; border-bottom:2px solid #000; }
+        .bk{ display:flex; padding:6px 8px; }
+        .bk.dv{ border-bottom:2px solid #000; }
+        .cl{ flex:1; padding-right:8px; }
+        .lb{ font-weight:bold; font-size:12px; }
+        .vl{ font-size:12px; }
+        .coil{ font-size:24px; font-weight:bold; font-family:monospace; letter-spacing:2px; }
+        .bcs{ display:flex; gap:30px; padding:4px 10px 0; }
+        .bc img{ height:50px; width:240px; }
+        .bcn{ font-family:monospace; font-size:12px; letter-spacing:2px; }
+        .wb{ border:2px solid #000; margin:8px; }
+        .wb-h{ text-align:center; font-weight:bold; font-size:12px; border-bottom:1px solid #000; padding:2px; }
+        .wb-t{ font-size:10px; padding:4px 8px; }
       </style>`;
 
     const win = window.open('', '_blank');
@@ -1037,7 +1091,6 @@ function retake() {
     document.getElementById('manualInput').value          = '';
     document.getElementById('confirmBtn').textContent     = 'Confirm';
     document.getElementById('confirmBtn').disabled        = false;
-    document.getElementById('fileInput').value            = '';
     currentResult = null;
 }
 

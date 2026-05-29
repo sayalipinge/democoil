@@ -54,15 +54,27 @@ older CRNN/Eff-DB research pipeline — that is NOT what production runs now.)
 | 3 | Blurry/noisy image → "Retake", block confirm | ✅ (Gemini `IMAGE_UNCLEAR`) |
 | 4 | Manual entry ALWAYS available, even on good read | ✅ (manual box now shows on success as override) |
 
-## 7. Printed label — ✅ TEMPLATE + BARCODE LIVE (fields fill when SAP read is wired)
-- Full JSW-style label now prints (2 or 3 copies): header (JSW / Made in India /
-  Dolvi address), product title, field grid, Code128 barcode + number, mill footer.
-  Buttons after confirm: "Print 2 Labels" / "Print 3 Labels".
-- Barcode: `GET /barcode/{value}` → Code128 SVG (python-barcode). Offline / same-origin.
-- Fields (customer, grade, destination...) come from SAP via `GET /label_data`
-  → `_fetch_sap_fields()`. OFF until `SAP_READ_ENDPOINT` + `SAP_READ_FIELD_MAP`
-  are set (in the SAP_* block). Until then the label prints the coil ID + barcode + blanks.
-- Verified 2026-05-29: endpoints return SVG + JSON; label rendered + screenshotted, matches the photo.
+## 7. Printed label — ✅ EXACT JSW LAYOUT LIVE (fields fill when SAP read is wired)
+- Matches the real JSW label: header band (MADE IN INDIA box | MS/SIRIM/PC no. |
+  JSW Steel + Dolvi address | QR top-right), "HOT Rolled Coil" title, then the exact
+  heading grid — Coil/Pack Number + Certified to Std; Size/Heat No/Grade;
+  Net Weight/Quality/Certification No; Customer/Delivery Cond./SO No./Insp. Date;
+  Shipping Mark/Destination/Batch Number/Inspected By; two Code128 barcodes;
+  WEIGH BRIDGE # IN footer. Buttons: "Print 2 / 3 Labels".
+- Graphics (offline, same-origin): `GET /barcode/{value}` (Code128 SVG, python-barcode),
+  `GET /qrcode/{value}` (QR SVG, segno).
+- Field values come from SAP via `GET /label_data` → `_fetch_sap_fields()`. OFF until
+  `SAP_READ_ENDPOINT` + `SAP_READ_FIELD_MAP` set. Until then: coil ID + barcodes + QR,
+  other fields blank ("-").
+- Field keys to map (SAP_READ_FIELD_MAP): product, cert_std, cert_no, grade, size,
+  heat_no, net_weight, quality, customer, so_no, destination, batch_no, delivery_cond,
+  insp_date, shipping_mark, inspected_by.
+- Verified 2026-05-29: endpoints return SVG/JSON; layout rendered + screenshotted vs photo.
+
+## 7b. UI changes (2026-05-29)
+- Page heading + title = **"JSW COIL-ID SCANNER"** (removed "JSW Coil OCR").
+- **Upload Image removed** — camera capture only ("Capture Photo"), so only freshly
+  clicked photos are read (no picking old gallery images).
 
 ## 8. Pending / next
 - [x] Worker-flow safety fixes (§6) — deployed

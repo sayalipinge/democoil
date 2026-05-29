@@ -9,3 +9,4 @@ numpy>=1.24.0
 google-genai>=0.3.0
 httpx>=0.25.0
 python-barcode>=0.15.1   # Code128 barcode (SVG) for the printed coil label
+segno>=1.6.0             # QR code (SVG) for the printed coil label
