@@ -23,6 +23,8 @@ Environment variables (.env file):
     MES_WEBHOOK_URL    — optional, POST coil_id to MES/SAP on confirm
     DRIVE_UPLOAD_URL   — optional, Google Apps Script URL that saves each coil
                          photo to Google Drive (for manager review). Unset = off.
+    SAP_USER/SAP_PASS  — optional, SAP login for the SAP push (see SAP_* block).
+    SAP_TOKEN          — optional, SAP bearer/OAuth token (alternative to user/pass).
     PORT               — optional, default 8000
 """
 import sys
@@ -72,6 +74,36 @@ MES_WEBHOOK_URL = os.environ.get("MES_WEBHOOK_URL", "").strip()
 # See drive_apps_script.gs for the script itself + setup steps.
 _DRIVE_URL_DEFAULT = "https://script.google.com/macros/s/AKfycbxjPKvOg9AVMEvpDjZee-NXlYKdgfg_aG5f5izujiQee1L2QDpNQ7tNPCnpMKtDyVL2/exec"
 DRIVE_UPLOAD_URL = os.environ.get("DRIVE_UPLOAD_URL", "").strip() or _DRIVE_URL_DEFAULT
+
+# ── SAP integration (push each confirmed coil ID into SAP) ─────────────────────
+# OFF until you fill SAP_ENDPOINT below. The whole app works fine without it.
+#
+# WHEN SAP/IT GIVES YOU THE DETAILS, edit ONLY the values in this block —
+# nothing else in the file needs to change. Map their answers like this:
+#   "the URL to send to"              -> SAP_ENDPOINT
+#   "how it logs in"                  -> SAP_AUTH_MODE  (+ user/pass or token)
+#   "which field the coil ID goes in" -> SAP_FIELD_COILID
+#   "is it an OData/Gateway service?" -> SAP_ODATA_CSRF
+#
+# --- 1. endpoint ----------------------------------------------------------------
+SAP_ENDPOINT = ""          # e.g. "https://sapgw.jsw.in/sap/opu/odata/sap/ZCOIL_SRV/CoilSet"
+                           # leave "" to keep SAP push DISABLED.
+# --- 2. login / auth ------------------------------------------------------------
+SAP_AUTH_MODE = "basic"    # "none" | "basic" | "bearer"
+#   SECURITY: do NOT paste a real SAP password here while the GitHub repo is
+#   public. Set SAP_USER / SAP_PASS / SAP_TOKEN as Render env vars (code reads
+#   env first). If env vars won't stick, make the repo PRIVATE before hardcoding.
+SAP_USER  = os.environ.get("SAP_USER",  "").strip()   # used when mode = "basic"
+SAP_PASS  = os.environ.get("SAP_PASS",  "").strip()   # used when mode = "basic"
+SAP_TOKEN = os.environ.get("SAP_TOKEN", "").strip()   # used when mode = "bearer"
+# --- 3. what to send ------------------------------------------------------------
+SAP_FIELD_COILID    = "CoilId"     # SAP's field name for the 10-digit ID.
+                                   # ask IT — could be "Charg"(batch) / "Matnr"(material) / a Z-field.
+SAP_FIELD_TIMESTAMP = "Timestamp"  # SAP's field for the scan time ("" = don't send time).
+SAP_EXTRA_FIELDS    = {}           # constant fields SAP needs, e.g. {"Werks": "1234", "Line": "HSM2"}.
+# --- 4. OData quirk -------------------------------------------------------------
+SAP_ODATA_CSRF = True      # True  -> SAP Gateway / OData (fetches an X-CSRF-Token first; required for writes).
+                           # False -> plain REST endpoint or PI-PO / CPI middleware.
 
 app = FastAPI(title="JSW Coil OCR", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -146,6 +178,57 @@ async def _send_to_drive(coil_id: str, image_path: str, worker_verified: bool):
         print(f"[drive] upload failed: {e}")
 
 
+async def _notify_sap(coil_id: str, timestamp: str):
+    """
+    Push one confirmed coil ID into SAP. Runs as a background task, so it NEVER
+    delays the worker's confirm. Does nothing until SAP_ENDPOINT is set.
+
+    Handles the two common SAP setups (toggle with SAP_ODATA_CSRF):
+      • plain REST / middleware (PI-PO, CPI)  -> SAP_ODATA_CSRF = False
+      • SAP Gateway / OData service           -> SAP_ODATA_CSRF = True
+        (OData rejects writes without an X-CSRF-Token, so we fetch one first.)
+
+    To change WHAT is sent or HOW it logs in, edit the SAP_* config block at the
+    top of this file — not this function. Debug via Render logs: look for [sap].
+    """
+    if not SAP_ENDPOINT:
+        return
+
+    # Build the JSON body SAP expects, straight from your field-name config.
+    payload = {SAP_FIELD_COILID: coil_id}
+    if SAP_FIELD_TIMESTAMP:
+        payload[SAP_FIELD_TIMESTAMP] = timestamp
+    payload.update(SAP_EXTRA_FIELDS)
+
+    # Auth, per SAP_AUTH_MODE.
+    auth    = None
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if SAP_AUTH_MODE == "basic":
+        auth = httpx.BasicAuth(SAP_USER, SAP_PASS)
+    elif SAP_AUTH_MODE == "bearer":
+        headers["Authorization"] = f"Bearer {SAP_TOKEN}"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, auth=auth) as client:
+            # OData/Gateway needs a CSRF token + session cookie before any write.
+            # One GET with "X-CSRF-Token: Fetch" returns the token; the same client
+            # keeps the cookie, so the POST below is accepted.
+            if SAP_ODATA_CSRF:
+                tok  = await client.get(SAP_ENDPOINT, headers={**headers, "X-CSRF-Token": "Fetch"})
+                csrf = tok.headers.get("x-csrf-token", "")
+                if csrf:
+                    headers["X-CSRF-Token"] = csrf
+                else:
+                    print("[sap] warning: no X-CSRF-Token returned; posting without it")
+            r = await client.post(SAP_ENDPOINT, json=payload, headers=headers)
+            if r.status_code in (200, 201, 202):
+                print(f"[sap] pushed coil {coil_id} -> {r.status_code}")
+            else:
+                print(f"[sap] push failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"[sap] push error: {e}")
+
+
 # ── PWA Manifest ─────────────────────────────────────────────────────────────
 @app.get("/manifest.json")
 def manifest():
@@ -214,6 +297,7 @@ def health():
         "mode":    "gemini_online" if has_key else "no_api_key",
         "mes_webhook":  bool(MES_WEBHOOK_URL),
         "drive_upload": bool(DRIVE_UPLOAD_URL),
+        "sap_push":     bool(SAP_ENDPOINT),
     }
 
 
@@ -261,6 +345,10 @@ async def confirm_endpoint(
     # Save the photo to Google Drive for manager review.
     # Background task = runs AFTER the response is sent, so confirm stays instant.
     background_tasks.add_task(_send_to_drive, coil_id, image_path, worker_verified)
+
+    # Push the coil ID into SAP (also background — see the SAP_* config block).
+    # No-op until SAP_ENDPOINT is filled, so this is safe to ship now.
+    background_tasks.add_task(_notify_sap, coil_id, timestamp)
 
     return result
 
