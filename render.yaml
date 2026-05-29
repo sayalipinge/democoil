@@ -22,6 +22,16 @@ services:
     region: singapore        # closest Render region to India
     healthCheckPath: /health
     envVars:
+      # All marked "sync: false" = SECRET. The NAME lives here in git, but you
+      # type the VALUE in Render after pushing (Blueprint -> Sync prompts you).
+      # This is the ONLY reliable way to set env vars on a Blueprint-managed
+      # service — hand-adding them in the Environment tab does not persist.
       - key: GEMINI_API_KEY_1
-        sync: false           # you set this secret in the Render dashboard
+        sync: false           # primary Gemini key (already set)
+      - key: GEMINI_API_KEY_2
+        sync: false           # 2nd Gemini key (separate Google project = 2x quota)
+      - key: GEMINI_API_KEY_3
+        sync: false           # 3rd Gemini key (separate Google project = 3x quota)
+      - key: DRIVE_UPLOAD_URL
+        sync: false           # Google Apps Script /exec URL — saves coil photos to Drive
       # PORT is injected automatically by Render — app.py reads it.
