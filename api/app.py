@@ -105,6 +105,33 @@ SAP_EXTRA_FIELDS    = {}           # constant fields SAP needs, e.g. {"Werks": "
 SAP_ODATA_CSRF = True      # True  -> SAP Gateway / OData (fetches an X-CSRF-Token first; required for writes).
                            # False -> plain REST endpoint or PI-PO / CPI middleware.
 
+# --- 5. READ-BACK (fills the printed label) ------------------------------------
+# To print a FULL JSW label (customer, grade, destination, weight...) the app must
+# look those fields up from SAP by coil ID. Ask IT for a READ (GET) endpoint.
+#   SAP_READ_ENDPOINT : GET URL with a {coil_id} placeholder, e.g.
+#     "https://sapgw.jsw.in/sap/opu/odata/sap/ZCOIL_SRV/CoilSet('{coil_id}')?$format=json"
+#     leave "" -> label prints the coil ID + blank fields (still usable).
+#   SAP_READ_FIELD_MAP: map each label field (left) to SAP's JSON key (right).
+#     Uncomment + set the ones your SAP returns; the rest stay blank.
+SAP_READ_ENDPOINT  = ""
+SAP_READ_FIELD_MAP = {
+    # label_field      : "SAP_JSON_KEY",
+    # "product"        : "ProductType",
+    # "grade"          : "Grade",
+    # "size"           : "Size",
+    # "heat_no"        : "HeatNo",
+    # "net_weight"     : "NetWeight",
+    # "quality"        : "Quality",
+    # "certification"  : "CertifiedToStd",
+    # "customer"       : "CustomerName",
+    # "so_no"          : "SoNumber",
+    # "destination"    : "Destination",
+    # "batch_no"       : "BatchNumber",
+    # "delivery_cond"  : "DeliveryCondition",
+    # "insp_date"      : "InspDate",
+    # "shipping_mark"  : "ShippingMark",
+}
+
 app = FastAPI(title="JSW Coil OCR", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
@@ -229,6 +256,48 @@ async def _notify_sap(coil_id: str, timestamp: str):
         print(f"[sap] push error: {e}")
 
 
+async def _fetch_sap_fields(coil_id: str) -> dict:
+    """
+    Read extra label fields (customer, grade, destination, ...) from SAP by coil ID.
+    Returns {} until SAP_READ_ENDPOINT is configured — the label then prints the
+    coil ID with blank fields, which is still usable.
+
+    Edit SAP_READ_ENDPOINT + SAP_READ_FIELD_MAP in the SAP_* config block to enable.
+    Debug via Render logs: look for [sap].
+    """
+    if not SAP_READ_ENDPOINT:
+        return {}
+    url     = SAP_READ_ENDPOINT.replace("{coil_id}", coil_id)
+    auth    = None
+    headers = {"Accept": "application/json"}
+    if SAP_AUTH_MODE == "basic":
+        auth = httpx.BasicAuth(SAP_USER, SAP_PASS)
+    elif SAP_AUTH_MODE == "bearer":
+        headers["Authorization"] = f"Bearer {SAP_TOKEN}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, auth=auth) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code != 200:
+                print(f"[sap] read failed: {r.status_code} {r.text[:150]}")
+                return {}
+            data = r.json()
+            # OData usually nests the record under d / d.results — dig in if present.
+            if isinstance(data, dict):
+                if isinstance(data.get("d"), dict):
+                    data = data["d"]
+                if isinstance(data.get("results"), list) and data["results"]:
+                    data = data["results"][0]
+            out = {}
+            if isinstance(data, dict):
+                for label_field, sap_key in SAP_READ_FIELD_MAP.items():
+                    if sap_key in data and data[sap_key] not in (None, ""):
+                        out[label_field] = data[sap_key]
+            return out
+    except Exception as e:
+        print(f"[sap] read error: {e}")
+        return {}
+
+
 # ── PWA Manifest ─────────────────────────────────────────────────────────────
 @app.get("/manifest.json")
 def manifest():
@@ -298,7 +367,32 @@ def health():
         "mes_webhook":  bool(MES_WEBHOOK_URL),
         "drive_upload": bool(DRIVE_UPLOAD_URL),
         "sap_push":     bool(SAP_ENDPOINT),
+        "sap_read":     bool(SAP_READ_ENDPOINT),
     }
+
+
+# ── Barcode (Code128 SVG) for the printed label ──────────────────────────────
+@app.get("/barcode/{value}")
+def barcode_svg(value: str):
+    """Code128 barcode of `value` as crisp SVG (used on the printed coil label)."""
+    import io
+    import barcode
+    from barcode.writer import SVGWriter
+    safe = "".join(ch for ch in value if ch.isalnum())[:24] or "0"
+    buf  = io.BytesIO()
+    barcode.get("code128", safe, writer=SVGWriter()).write(
+        buf, options={"write_text": False, "module_height": 12.0,
+                      "module_width": 0.3, "quiet_zone": 1.0})
+    return Response(content=buf.getvalue(), media_type="image/svg+xml")
+
+
+# ── Label data (coil ID + SAP fields, if read is configured) ─────────────────
+@app.get("/label_data")
+async def label_data(coil_id: str):
+    """Fields for the printed label. coil_id always present; rest come from SAP read."""
+    ok     = len(coil_id) == 10 and coil_id.isdigit()
+    fields = await _fetch_sap_fields(coil_id) if ok else {}
+    return {"coil_id": coil_id, "fields": fields, "sap_read": bool(SAP_READ_ENDPOINT)}
 
 
 # ── Predict endpoint ─────────────────────────────────────────────────────────
@@ -524,10 +618,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 
     <!-- Print (shows after confirm) -->
     <div class="print-section" id="printSection">
-      <div style="font-size:14px; color:#94a3b8; margin-bottom:8px; text-align:center;">Print stickers:</div>
+      <div style="font-size:14px; color:#94a3b8; margin-bottom:8px; text-align:center;">Print labels:</div>
       <div class="print-row">
-        <button class="btn btn-print" onclick="printStickers(2)">Print 2</button>
-        <button class="btn btn-print" onclick="printStickers(3)">Print 3</button>
+        <button class="btn btn-print" onclick="printLabel(2)">Print 2 Labels</button>
+        <button class="btn btn-print" onclick="printLabel(3)">Print 3 Labels</button>
       </div>
     </div>
   </div>
@@ -866,25 +960,74 @@ async function confirmId() {
 }
 
 // ── Print stickers ────────────────────────────────────────────────────────────
-function printStickers(count) {
+async function printLabel(count) {
     const coilId = document.getElementById('resultId').textContent.replace(/\s/g,'');
-    if (!coilId || coilId.length !== 10 || !/^\d+$/.test(coilId)) return;
-
-    const win = window.open('', '_blank', 'width=400,height=300');
-    let stickers = '';
-    for (let i = 0; i < count; i++) {
-        stickers += '<div style="border:2px solid #000;padding:15px 25px;margin:10px;display:inline-block;'
-                  + 'font-family:monospace;font-size:28px;font-weight:bold;letter-spacing:3px;">'
-                  + coilId + '</div>';
+    if (!coilId || coilId.length !== 10 || !/^\d+$/.test(coilId)) {
+        alert('Confirm a valid 10-digit coil ID first.');
+        return;
     }
-    win.document.write(
-        '<html><head><title>Print Stickers</title></head>'
-        + '<body style="text-align:center;padding:20px;">'
-        + '<h3 style="margin-bottom:15px;">JSW Coil ID Stickers</h3>'
-        + stickers
-        + '<br><button onclick="window.print()" style="margin-top:20px;padding:10px 30px;font-size:16px;cursor:pointer;">Print</button>'
-        + '</body></html>'
-    );
+
+    // Pull label fields (customer, grade, ...) — empty until SAP read is wired.
+    let fields = {};
+    try {
+        const resp = await fetch('/label_data?coil_id=' + encodeURIComponent(coilId));
+        const data = await resp.json();
+        fields = data.fields || {};
+    } catch(e) { /* offline / SAP off -> print ID + blank fields */ }
+
+    const v = k => (fields[k] !== undefined && fields[k] !== null && fields[k] !== '') ? fields[k] : '—';
+    const origin = window.location.origin;
+
+    const oneLabel = () => `
+      <div class="lbl">
+        <div class="lbl-head">
+          <div class="made">MADE<br>IN<br>INDIA</div>
+          <div class="brand"><i>JSW</i> <span>Steel</span></div>
+          <div class="addr">Dolvi Works, Taluka - Pen, Dist - Raigad,<br>Maharashtra - 402107, India</div>
+        </div>
+        <div class="lbl-title">${v('product')==='—' ? 'HOT ROLLED COIL' : v('product')}</div>
+        <table class="lbl-tbl">
+          <tr><td class="k">Coil/Pack Number</td><td class="big" colspan="3">${coilId}</td></tr>
+          <tr><td class="k">Grade</td><td>${v('grade')}</td><td class="k">Heat No</td><td>${v('heat_no')}</td></tr>
+          <tr><td class="k">Size (mm)</td><td>${v('size')}</td><td class="k">Net Weight (MT)</td><td>${v('net_weight')}</td></tr>
+          <tr><td class="k">Quality</td><td>${v('quality')}</td><td class="k">Certified to Std</td><td>${v('certification')}</td></tr>
+          <tr><td class="k">Customer Name</td><td>${v('customer')}</td><td class="k">SO No.</td><td>${v('so_no')}</td></tr>
+          <tr><td class="k">Destination</td><td>${v('destination')}</td><td class="k">Batch Number</td><td>${v('batch_no')}</td></tr>
+          <tr><td class="k">Delivery Condition</td><td>${v('delivery_cond')}</td><td class="k">Insp. Date</td><td>${v('insp_date')}</td></tr>
+          <tr><td class="k">Shipping Mark</td><td colspan="3">${v('shipping_mark')}</td></tr>
+        </table>
+        <div class="lbl-bc"><img src="${origin}/barcode/${coilId}" alt="${coilId}"><div class="bc-num">${coilId}</div></div>
+        <div class="lbl-foot">Weighed on the Mill scale certified by the Weights and Measures Department.</div>
+      </div>`;
+
+    let labels = '';
+    for (let i = 0; i < count; i++) labels += oneLabel();
+
+    const css = `<style>
+        @media print { .noprint{display:none} @page{ margin:8mm } }
+        body{ font-family:Arial,sans-serif; padding:10px; }
+        .lbl{ border:2px solid #000; padding:10px 14px; margin:0 0 14px; width:480px; page-break-inside:avoid; }
+        .lbl-head{ display:flex; align-items:center; gap:10px; border-bottom:2px solid #000; padding-bottom:6px; }
+        .made{ font-size:8px; font-weight:bold; text-align:center; border:1px solid #000; padding:2px 4px; line-height:1.1; }
+        .brand{ font-size:26px; font-weight:bold; } .brand span{ font-size:13px; font-weight:normal; }
+        .addr{ font-size:9px; color:#222; margin-left:auto; text-align:right; }
+        .lbl-title{ text-align:center; font-weight:bold; font-size:13px; padding:5px 0; border-bottom:1px solid #000; }
+        .lbl-tbl{ width:100%; border-collapse:collapse; margin-top:4px; }
+        .lbl-tbl td{ border:1px solid #999; padding:3px 6px; font-size:11px; vertical-align:top; }
+        .lbl-tbl .k{ color:#444; font-size:9px; width:92px; }
+        .lbl-tbl .big{ font-size:20px; font-weight:bold; letter-spacing:2px; font-family:monospace; }
+        .lbl-bc{ text-align:center; margin-top:8px; }
+        .lbl-bc img{ height:46px; width:90%; }
+        .bc-num{ font-family:monospace; font-size:13px; letter-spacing:3px; }
+        .lbl-foot{ font-size:8px; color:#333; border-top:1px solid #000; margin-top:6px; padding-top:4px; }
+      </style>`;
+
+    const win = window.open('', '_blank');
+    win.document.write('<html><head><title>JSW Coil Label</title>' + css + '</head><body>'
+        + labels
+        + '<button class="noprint" onclick="window.print()" style="padding:10px 30px;font-size:16px;cursor:pointer;margin:10px 0;">Print</button>'
+        + '</body></html>');
+    win.document.close();
 }
 
 // ── Retake ────────────────────────────────────────────────────────────────────
