@@ -195,7 +195,7 @@ RULES:
 2. The digits are spray-painted in white/light color on the dark steel surface.
 3. The number may be curved (painted on round coil surface).
 4. IGNORE any stickers, labels, tags, or printed text. Read ONLY the spray-painted number.
-5. If a black plastic strap/band is covering any digits, respond with: STRAP_BLOCKED
+5. If a black, grey, or silver plastic strap/band is covering ANY digit (even partly), respond with: STRAP_BLOCKED
 6. Only if the digits are GENUINELY unreadable (too blurry, dark, or angled),
    respond with: IMAGE_UNCLEAR. Do NOT use IMAGE_UNCLEAR just because of an
    extra letter or mark next to the number.

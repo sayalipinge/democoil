@@ -512,7 +512,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 
     <!-- Manual entry -->
     <div class="manual-entry" id="manualEntry" style="display:none;">
-      <label>Enter coil ID manually (10 digits):</label>
+      <label id="manualLabel">Enter coil ID manually (10 digits):</label>
       <input type="tel" id="manualInput" maxlength="10" placeholder="0000000000" oninput="validateManual()">
     </div>
 
@@ -714,6 +714,9 @@ function showResult(r) {
     warnings.innerHTML   = '';
     manual.style.display = 'none';
     confirmBtn.disabled  = false;
+    // reset the manual box each time a new result comes in
+    document.getElementById('manualLabel').textContent = 'Enter coil ID manually (10 digits):';
+    document.getElementById('manualInput').value = '';
 
     const status = r.status || '';
 
@@ -727,6 +730,11 @@ function showResult(r) {
         idBox.textContent = r.coil_id;
         idBox.className   = 'result-id ' + (r.pattern ? 'success' : 'warning');
 
+        // Feature #4: manual override is ALWAYS available, even on a good read.
+        // Worker can confirm the detected ID as-is, OR type a correction here.
+        manual.style.display = 'block';
+        document.getElementById('manualLabel').textContent = 'AI read it above. Wrong? Type the correct 10 digits:';
+
         if (r.duplicate_warning) {
             warnings.innerHTML += '<div class="warning-box dup-warning">&#x26A0; DUPLICATE: This coil ID already scanned '
                 + (r.duplicate_count || 1) + ' time(s)!</div>';
@@ -739,11 +747,11 @@ function showResult(r) {
     } else if (status === 'strap_blocked') {
         icon.className = 'status-icon status-warn';
         icon.innerHTML = '&#x26A0;';
-        document.getElementById('statusText').textContent   = 'Black Strap Detected';
+        document.getElementById('statusText').textContent   = 'Strap Detected';
         document.getElementById('statusDetail').textContent = 'Enter coil ID manually';
         idBox.textContent = '_ _ _ _ _ _ _ _ _ _';
         idBox.className   = 'result-id warning';
-        warnings.innerHTML = '<div class="warning-box strap-warning">&#x1F6AB; Black strap is blocking digits. Type the ID manually.</div>';
+        warnings.innerHTML = '<div class="warning-box strap-warning">&#x1F6AB; A strap is blocking the digits. Type the ID manually.</div>';
         manual.style.display = 'block';
         confirmBtn.disabled  = true;
 
@@ -798,10 +806,20 @@ function validateManual() {
     const input = document.getElementById('manualInput');
     const val   = input.value.replace(/[^0-9]/g, '');
     input.value = val;
-    document.getElementById('confirmBtn').disabled = (val.length !== 10);
+    const detected = (currentResult && currentResult.coil_id && currentResult.coil_id.length === 10)
+                     ? currentResult.coil_id : null;
     if (val.length === 10) {
+        // worker typed a full override → use it
+        document.getElementById('confirmBtn').disabled  = false;
         document.getElementById('resultId').textContent = val;
         document.getElementById('resultId').className   = 'result-id warning';
+    } else if (val.length === 0 && detected) {
+        // override cleared → fall back to confirming the AI-detected ID
+        document.getElementById('confirmBtn').disabled  = false;
+        document.getElementById('resultId').textContent = detected;
+    } else {
+        // partial typing → not a valid 10-digit ID yet
+        document.getElementById('confirmBtn').disabled = true;
     }
 }
 
@@ -815,6 +833,14 @@ async function confirmId() {
     if (!coilId || coilId.length !== 10) {
         alert('No valid 10-digit coil ID to confirm');
         return;
+    }
+
+    // Feature #2: if this ID is already in inventory, make the worker choose.
+    if (currentResult && currentResult.duplicate_warning && coilId === currentResult.coil_id) {
+        const n = currentResult.duplicate_count || 1;
+        if (!confirm('This coil ID was already scanned ' + n + ' time(s).\nScan it again anyway?')) {
+            return;  // worker chose NOT to re-scan the duplicate
+        }
     }
 
     try {
