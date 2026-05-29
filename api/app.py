@@ -60,15 +60,18 @@ SAVE_QUALITY  = 70    # JPEG quality for saved images
 # ── MES/SAP webhook (optional) ───────────────────────────────────────────────
 MES_WEBHOOK_URL = os.environ.get("MES_WEBHOOK_URL", "").strip()
 
-# ── Google Drive photo upload (optional) ─────────────────────────────────────
+# ── Google Drive photo upload ────────────────────────────────────────────────
 # Each confirmed coil photo is sent to a Google Apps Script web-app, which saves
 # it into a Drive folder ("JSW Coil Photos") on YOUR Google account. The manager
 # opens that folder to check whether workers photograph coils properly.
 #
-#   ENABLE : set DRIVE_UPLOAD_URL in Render env = your Apps Script web-app URL
-#            (the .../exec link). See drive_apps_script.gs for the script + setup.
-#   DISABLE: leave it unset → upload is skipped, app behaves exactly as before.
-DRIVE_UPLOAD_URL = os.environ.get("DRIVE_UPLOAD_URL", "").strip()
+# The /exec URL is baked in below (Render env vars wouldn't stick, so we hardcode).
+#   CHANGE the script : replace the URL in _DRIVE_URL_DEFAULT below.
+#   DISABLE uploads   : set _DRIVE_URL_DEFAULT = "" (empty string).
+#   OVERRIDE via env  : if DRIVE_UPLOAD_URL is set in Render, it wins over the default.
+# See drive_apps_script.gs for the script itself + setup steps.
+_DRIVE_URL_DEFAULT = "https://script.google.com/macros/s/AKfycbxjPKvOg9AVMEvpDjZee-NXlYKdgfg_aG5f5izujiQee1L2QDpNQ7tNPCnpMKtDyVL2/exec"
+DRIVE_UPLOAD_URL = os.environ.get("DRIVE_UPLOAD_URL", "").strip() or _DRIVE_URL_DEFAULT
 
 app = FastAPI(title="JSW Coil OCR", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
