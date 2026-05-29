@@ -21,11 +21,14 @@ Environment variables (.env file):
     GEMINI_API_KEY_2   — optional backup key
     GEMINI_API_KEY_3   — optional backup key
     MES_WEBHOOK_URL    — optional, POST coil_id to MES/SAP on confirm
+    DRIVE_UPLOAD_URL   — optional, Google Apps Script URL that saves each coil
+                         photo to Google Drive (for manager review). Unset = off.
     PORT               — optional, default 8000
 """
 import sys
 import json
 import os
+import base64
 import cv2
 import numpy as np
 import httpx
@@ -34,7 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
@@ -56,6 +59,16 @@ SAVE_QUALITY  = 70    # JPEG quality for saved images
 
 # ── MES/SAP webhook (optional) ───────────────────────────────────────────────
 MES_WEBHOOK_URL = os.environ.get("MES_WEBHOOK_URL", "").strip()
+
+# ── Google Drive photo upload (optional) ─────────────────────────────────────
+# Each confirmed coil photo is sent to a Google Apps Script web-app, which saves
+# it into a Drive folder ("JSW Coil Photos") on YOUR Google account. The manager
+# opens that folder to check whether workers photograph coils properly.
+#
+#   ENABLE : set DRIVE_UPLOAD_URL in Render env = your Apps Script web-app URL
+#            (the .../exec link). See drive_apps_script.gs for the script + setup.
+#   DISABLE: leave it unset → upload is skipped, app behaves exactly as before.
+DRIVE_UPLOAD_URL = os.environ.get("DRIVE_UPLOAD_URL", "").strip()
 
 app = FastAPI(title="JSW Coil OCR", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -90,6 +103,44 @@ async def _notify_mes(coil_id: str, timestamp: str, image_path: str):
             })
     except Exception as e:
         print(f"[mes_webhook] Failed to notify MES: {e}")
+
+
+async def _send_to_drive(coil_id: str, image_path: str, worker_verified: bool):
+    """
+    Upload one confirmed coil photo to Google Drive (via Apps Script web-app).
+
+    Runs as a FastAPI background task, so it NEVER delays the worker's confirm.
+    Silently does nothing if DRIVE_UPLOAD_URL is not set or the image is missing.
+    The saved file name carries the info the manager needs:
+        <coil_id>_<YYYY-MM-DD>_<HHMM>_<auto|manual>.jpg
+    e.g. 0226031432_2026-05-29_1253_auto.jpg
+    """
+    if not DRIVE_UPLOAD_URL:
+        return
+    try:
+        # image_path already points to a compressed ~80KB JPEG (see _save_compressed)
+        img_bytes = Path(image_path).read_bytes()
+    except Exception as e:
+        print(f"[drive] cannot read image {image_path}: {e}")
+        return
+
+    tag      = "manual" if worker_verified else "auto"
+    stamp    = datetime.now().strftime("%Y-%m-%d_%H%M")
+    filename = f"{coil_id}_{stamp}_{tag}.jpg"
+
+    payload = {
+        "filename":  filename,
+        "image_b64": base64.b64encode(img_bytes).decode(),
+    }
+    try:
+        # follow_redirects=True is REQUIRED: Apps Script replies with a 302 to
+        # googleusercontent.com that holds the actual {"ok":true} response body.
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            r = await client.post(DRIVE_UPLOAD_URL, json=payload)
+            if r.status_code != 200 or '"ok"' not in r.text:
+                print(f"[drive] upload may have failed: {r.status_code} {r.text[:150]}")
+    except Exception as e:
+        print(f"[drive] upload failed: {e}")
 
 
 # ── PWA Manifest ─────────────────────────────────────────────────────────────
@@ -158,7 +209,8 @@ def health():
         "status":  "ok",
         "version": "3.0.0",
         "mode":    "gemini_online" if has_key else "no_api_key",
-        "mes_webhook": bool(MES_WEBHOOK_URL),
+        "mes_webhook":  bool(MES_WEBHOOK_URL),
+        "drive_upload": bool(DRIVE_UPLOAD_URL),
     }
 
 
@@ -189,6 +241,7 @@ async def predict_endpoint(file: UploadFile = File(...)):
 # ── Confirm endpoint ─────────────────────────────────────────────────────────
 @app.post("/confirm")
 async def confirm_endpoint(
+    background_tasks: BackgroundTasks,
     coil_id:         str  = Form(...),
     image_path:      str  = Form(""),
     worker_verified: bool = Form(False),
@@ -201,6 +254,10 @@ async def confirm_endpoint(
 
     # Notify MES/SAP (fire and forget — won't delay response)
     await _notify_mes(coil_id, timestamp, image_path)
+
+    # Save the photo to Google Drive for manager review.
+    # Background task = runs AFTER the response is sent, so confirm stays instant.
+    background_tasks.add_task(_send_to_drive, coil_id, image_path, worker_verified)
 
     return result
 
