@@ -135,6 +135,16 @@ def predict(image_input,
         "method":           "gemini",
     }
 
+    # A selected yard is authoritative. Do not present a wrong-yard read as valid.
+    if (pattern_hint and result["coil_id"]
+            and result.get("status") == "success"
+            and result.get("pattern") != pattern_hint):
+        result["status"] = "yard_mismatch"
+        result["requires_worker"] = True
+        result["quality_issues"].append(
+            f"Read does not match selected {pattern_hint} yard format"
+        )
+
     # ── Strap detected → worker must type ───────────────────────────────────
     if result["strap_detected"]:
         result["status"] = "strap_blocked"
@@ -161,10 +171,11 @@ def predict(image_input,
 # ── Register confirmed coil ──────────────────────────────────────────────────
 def register_coil(coil_id: str,
                   image_path: str = "",
-                  worker_verified: bool = False) -> dict:
+                  worker_verified: bool = False,
+                  worker: Optional[dict] = None) -> dict:
     """
     Register a confirmed coil ID into inventory.
     Call this after worker clicks Confirm.
     """
     inv = _get_inventory()
-    return inv.register(coil_id, image_path, worker_verified)
+    return inv.register(coil_id, image_path, worker_verified, worker)

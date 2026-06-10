@@ -27,6 +27,7 @@ import os
 import re
 import cv2
 import numpy as np
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
@@ -208,6 +209,26 @@ Respond with one of:
 - IMAGE_UNCLEAR"""
 
 
+def _prompt_for_pattern(pattern_hint: Optional[str]) -> str:
+    """Add the selected yard's known structure to the OCR instruction."""
+    year = datetime.now().strftime("%y")
+    if pattern_hint == "HSM2":
+        return _OCR_PROMPT + (
+            f"\n\nYARD CONTEXT: This photo is from HSM Yard. The valid ID format for "
+            f"the current year is 02{year} followed by exactly 6 digits. Use this "
+            f"known prefix to resolve unclear prefix digits, but never invent the "
+            f"final 6 digits."
+        )
+    if pattern_hint == "CSP":
+        return _OCR_PROMPT + (
+            f"\n\nYARD CONTEXT: This photo is from CSP Yard. The valid ID format for "
+            f"the current year is {year}, then one shell digit, then 0, followed by "
+            f"exactly 6 digits. Use the fixed positions to resolve unclear digits, "
+            f"but never invent the remaining digits."
+        )
+    return _OCR_PROMPT
+
+
 # ── Main OCR function ─────────────────────────────────────────────────────────
 def read_coil_id(image_input: Union[str, Path, bytes],
                  pattern_hint: Optional[str] = None) -> dict:
@@ -237,7 +258,7 @@ def read_coil_id(image_input: Union[str, Path, bytes],
 
     # Step 2: Call Gemini
     try:
-        raw = _call_gemini(image_bytes, mime_type, _OCR_PROMPT)
+        raw = _call_gemini(image_bytes, mime_type, _prompt_for_pattern(pattern_hint))
     except QuotaExhaustedException as e:
         return {
             "coil_id": None, "confidence": 0.0, "pattern": None,

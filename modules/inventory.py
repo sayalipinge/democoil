@@ -78,7 +78,8 @@ class InventoryManager:
         return {"is_duplicate": False, "previous_scan": None, "count": 0}
 
     def register(self, coil_id: str, image_path: str = "",
-                 worker_verified: bool = False) -> dict:
+                 worker_verified: bool = False,
+                 worker: Optional[dict] = None) -> dict:
         """
         Register a new coil scan. Returns duplicate info.
         """
@@ -89,6 +90,10 @@ class InventoryManager:
             "timestamp": datetime.now().isoformat(),
             "image_path": str(image_path),
             "worker_verified": worker_verified,
+            "worker_id": (worker or {}).get("worker_id", ""),
+            "worker_name": (worker or {}).get("full_name", ""),
+            "shift": (worker or {}).get("shift", ""),
+            "yard": (worker or {}).get("yard", ""),
         }
 
         dup_info = self.check_duplicate(coil_id)

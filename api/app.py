@@ -45,6 +45,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from pipeline.gemini_pipeline import predict, register_coil
 from modules.inventory import InventoryManager
+from modules.worker_accounts import WorkerAccountManager
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -53,6 +54,25 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR   = Path(os.environ.get("DATA_DIR", str(ROOT / "data")))
 UPLOAD_DIR = DATA_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+worker_accounts = WorkerAccountManager()
+
+
+def _require_worker(token: str) -> dict:
+    worker = worker_accounts.authenticate(token)
+    if not worker:
+        raise HTTPException(401, "Login required")
+    return worker
+
+
+def _pattern_for_yard(yard: str) -> str:
+    return "HSM2" if yard == "HSM Yard" else "CSP"
+
+
+def _coil_matches_yard(coil_id: str, yard: str) -> bool:
+    year = datetime.now().strftime("%y")
+    if yard == "HSM Yard":
+        return coil_id.startswith(f"02{year}")
+    return coil_id.startswith(year) and coil_id[3] == "0"
 
 # ── Image save settings ──────────────────────────────────────────────────────
 # Save compressed image (not full 4MB raw). Same compression as Gemini gets.
@@ -149,7 +169,7 @@ def _save_compressed(image_bgr: np.ndarray, path: Path):
     cv2.imwrite(str(path), image_bgr, [cv2.IMWRITE_JPEG_QUALITY, SAVE_QUALITY])
 
 
-async def _notify_mes(coil_id: str, timestamp: str, image_path: str):
+async def _notify_mes(coil_id: str, timestamp: str, image_path: str, worker: dict):
     """
     POST coil data to MES/SAP webhook after worker confirms.
     Set MES_WEBHOOK_URL in .env to enable. Does nothing if not set.
@@ -163,13 +183,22 @@ async def _notify_mes(coil_id: str, timestamp: str, image_path: str):
                 "coil_id":    coil_id,
                 "timestamp":  timestamp,
                 "image_path": image_path,
+                "worker_id":  worker["worker_id"],
+                "worker_name": worker["full_name"],
+                "shift":      worker["shift"],
+                "yard":       worker["yard"],
                 "source":     "jsw_coil_ocr",
             })
     except Exception as e:
         print(f"[mes_webhook] Failed to notify MES: {e}")
 
 
-async def _send_to_drive(coil_id: str, image_path: str, worker_verified: bool):
+async def _send_to_drive(
+    coil_id: str,
+    image_path: str,
+    worker_verified: bool,
+    worker: dict,
+):
     """
     Upload one confirmed coil photo to Google Drive (via Apps Script web-app).
 
@@ -190,11 +219,20 @@ async def _send_to_drive(coil_id: str, image_path: str, worker_verified: bool):
 
     tag      = "manual" if worker_verified else "auto"
     stamp    = datetime.now().strftime("%Y-%m-%d_%H%M")
-    filename = f"{coil_id}_{stamp}_{tag}.jpg"
+    worker_id = worker["worker_id"].replace(" ", "_")
+    yard = worker["yard"].replace(" Yard", "").upper()
+    shift = worker["shift"].replace(" Shift", "").replace(" ", "_")
+    filename = f"{coil_id}_{stamp}_{worker_id}_{yard}_{shift}_{tag}.jpg"
 
     payload = {
         "filename":  filename,
         "image_b64": base64.b64encode(img_bytes).decode(),
+        "coil_id": coil_id,
+        "worker_id": worker["worker_id"],
+        "worker_name": worker["full_name"],
+        "shift": worker["shift"],
+        "yard": worker["yard"],
+        "worker_verified": worker_verified,
     }
     try:
         # follow_redirects=True is REQUIRED: Apps Script replies with a 302 to
@@ -308,7 +346,9 @@ def manifest():
         "name":             "JSW Coil OCR",
         "short_name":       "CoilOCR",
         "description":      "Scan steel coil IDs with phone camera",
+        "id":               "/",
         "start_url":        "/",
+        "scope":            "/",
         "display":          "standalone",
         "background_color": "#0f172a",
         "theme_color":      "#3b82f6",
@@ -318,6 +358,57 @@ def manifest():
             {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
         ],
     })
+
+
+@app.get("/sw.js")
+def service_worker():
+    """Tiny service worker so Android Chrome treats the site as installable."""
+    js = r"""
+const CACHE_NAME = 'jsw-coil-scanner-v2';
+const APP_SHELL = ['/', '/manifest.json', '/icon-192.png', '/icon-512.png'];
+
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then(cache => cache.addAll(APP_SHELL))
+      .then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(keys.map(key => key === CACHE_NAME ? null : caches.delete(key))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', event => {
+  const request = event.request;
+  const url = new URL(request.url);
+
+  if (request.method !== 'GET' || url.origin !== self.location.origin) {
+    return;
+  }
+
+  if (url.pathname === '/' || url.pathname === '/manifest.json' || url.pathname.startsWith('/icon-')) {
+    event.respondWith(
+      fetch(request)
+        .then(response => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(request, copy));
+          return response;
+        })
+        .catch(() => caches.match(request))
+    );
+  }
+});
+"""
+    return Response(
+        content=js,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/icon-{size}.png")
@@ -410,8 +501,52 @@ async def label_data(coil_id: str):
 
 
 # ── Predict endpoint ─────────────────────────────────────────────────────────
+@app.post("/worker/register")
+def worker_register(
+    worker_id: str = Form(...),
+    full_name: str = Form(...),
+    pin: str = Form(...),
+    shift: str = Form(...),
+    yard: str = Form(...),
+):
+    try:
+        return worker_accounts.register(worker_id, full_name, pin, shift, yard)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/worker/login")
+def worker_login(worker_id: str = Form(...), pin: str = Form(...)):
+    try:
+        return worker_accounts.login(worker_id, pin)
+    except ValueError as e:
+        raise HTTPException(401, str(e))
+
+
+@app.post("/worker/session")
+def worker_session(session_token: str = Form(...)):
+    return {"worker": _require_worker(session_token)}
+
+
+@app.post("/worker/context")
+def worker_context(
+    session_token: str = Form(...),
+    shift: str = Form(...),
+    yard: str = Form(...),
+):
+    _require_worker(session_token)
+    try:
+        return {"worker": worker_accounts.update_context(session_token, shift, yard)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.post("/predict")
-async def predict_endpoint(file: UploadFile = File(...)):
+async def predict_endpoint(
+    file: UploadFile = File(...),
+    session_token: str = Form(...),
+):
+    worker = _require_worker(session_token)
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(400, "File must be an image")
 
@@ -423,13 +558,19 @@ async def predict_endpoint(file: UploadFile = File(...)):
         raise HTTPException(400, "Could not decode image")
 
     # Save compressed image (not full resolution)
-    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = UPLOAD_DIR / f"scan_{ts}.jpg"
+    ts        = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    save_path = UPLOAD_DIR / f"scan_{ts}_{worker['worker_id']}.jpg"
     _save_compressed(image_bgr, save_path)
 
     # Run prediction
-    result = predict(image_bgr, check_inventory=True, image_path=str(save_path))
+    result = predict(
+        image_bgr,
+        pattern_hint=_pattern_for_yard(worker["yard"]),
+        check_inventory=True,
+        image_path=str(save_path),
+    )
     result["image_saved"] = str(save_path)
+    result["yard"] = worker["yard"]
     return result
 
 
@@ -440,30 +581,45 @@ async def confirm_endpoint(
     coil_id:         str  = Form(...),
     image_path:      str  = Form(""),
     worker_verified: bool = Form(False),
+    session_token:   str  = Form(...),
 ):
+    worker = _require_worker(session_token)
     if len(coil_id) != 10 or not coil_id.isdigit():
         raise HTTPException(400, "Coil ID must be exactly 10 digits")
+    if not _coil_matches_yard(coil_id, worker["yard"]):
+        year = datetime.now().strftime("%y")
+        expected = (
+            f"02{year} + 6 digits"
+            if worker["yard"] == "HSM Yard"
+            else f"{year} + shell digit + 0 + 6 digits"
+        )
+        raise HTTPException(
+            400, f"Coil ID does not match {worker['yard']}: expected {expected}"
+        )
 
-    result    = register_coil(coil_id, image_path, worker_verified)
+    result    = register_coil(coil_id, image_path, worker_verified, worker)
     timestamp = datetime.now().isoformat()
 
     # Notify MES/SAP (fire and forget — won't delay response)
-    await _notify_mes(coil_id, timestamp, image_path)
+    await _notify_mes(coil_id, timestamp, image_path, worker)
 
     # Save the photo to Google Drive for manager review.
     # Background task = runs AFTER the response is sent, so confirm stays instant.
-    background_tasks.add_task(_send_to_drive, coil_id, image_path, worker_verified)
+    background_tasks.add_task(
+        _send_to_drive, coil_id, image_path, worker_verified, worker
+    )
 
     # Push the coil ID into SAP (also background — see the SAP_* config block).
     # No-op until SAP_ENDPOINT is filled, so this is safe to ship now.
     background_tasks.add_task(_notify_sap, coil_id, timestamp)
 
-    return result
+    return {**result, "worker": worker}
 
 
 # ── History endpoint ─────────────────────────────────────────────────────────
 @app.get("/history")
-def history_endpoint():
+def history_endpoint(session_token: str):
+    worker = _require_worker(session_token)
     inv     = InventoryManager()
     all_c   = inv.get_all()
     cutoff  = datetime.now() - timedelta(days=2)
@@ -474,11 +630,17 @@ def history_endpoint():
             try:
                 scan_time = datetime.fromisoformat(scan["timestamp"])
                 if scan_time >= cutoff:
+                    if scan.get("worker_id") != worker["worker_id"]:
+                        continue
                     recent.append({
                         "coil_id":         coil_id,
                         "timestamp":       scan["timestamp"],
                         "image_path":      scan.get("image_path", ""),
                         "worker_verified": scan.get("worker_verified", False),
+                        "worker_id":       scan.get("worker_id", ""),
+                        "worker_name":     scan.get("worker_name", ""),
+                        "shift":           scan.get("shift", ""),
+                        "yard":            scan.get("yard", ""),
                     })
             except (ValueError, KeyError):
                 pass
@@ -519,6 +681,25 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 .header h1 { font-size: 20px; color: #3b82f6; }
 .header .mode { font-size: 12px; color: #94a3b8; margin-top: 4px; }
 .container { max-width: 480px; margin: 0 auto; padding: 16px; }
+.auth-screen { position: fixed; inset: 0; z-index: 100; background: #0f172a; overflow-y: auto; padding: 28px 16px; }
+.auth-box { max-width: 420px; margin: 0 auto; }
+.auth-title { color: #3b82f6; font-size: 24px; text-align: center; margin-bottom: 6px; }
+.auth-subtitle { color: #94a3b8; text-align: center; margin-bottom: 22px; font-size: 14px; }
+.auth-tabs { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid #334155; margin-bottom: 18px; }
+.auth-tab { border: 0; background: transparent; color: #94a3b8; padding: 12px; font-size: 15px; font-weight: 700; }
+.auth-tab.active { color: #60a5fa; border-bottom: 3px solid #3b82f6; }
+.auth-form { display: grid; gap: 12px; }
+.auth-form label { color: #cbd5e1; font-size: 13px; }
+.auth-form input, .auth-form select, .context-select { width: 100%; border: 1px solid #475569; background: #111827; color: #f8fafc; border-radius: 6px; padding: 13px; font-size: 16px; }
+.auth-error { min-height: 20px; color: #fca5a5; font-size: 13px; }
+.worker-bar { display: none; margin-bottom: 14px; border-bottom: 1px solid #334155; padding: 0 0 12px; }
+.worker-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.worker-name { font-weight: 700; }
+.worker-meta { color: #94a3b8; font-size: 12px; margin-top: 3px; }
+.worker-actions { display: flex; gap: 8px; }
+.btn-small { padding: 8px 10px; font-size: 13px; border-radius: 6px; border: 1px solid #475569; background: transparent; color: #cbd5e1; }
+.context-panel { display: none; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.context-panel .btn-small { grid-column: 1 / -1; background: #2563eb; color: white; border: 0; }
 
 /* Camera */
 .camera-section { text-align: center; margin-bottom: 16px; }
@@ -583,12 +764,63 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 </head>
 <body>
 
+<div class="auth-screen" id="authScreen">
+  <div class="auth-box">
+    <div class="auth-title">JSW COIL-ID SCANNER</div>
+    <div class="auth-subtitle">Worker access</div>
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="loginTab" onclick="showAuthMode('login')">Sign In</button>
+      <button class="auth-tab" id="registerTab" onclick="showAuthMode('register')">Create Account</button>
+    </div>
+    <form class="auth-form" id="loginForm" onsubmit="loginWorker(event)">
+      <label>Worker ID<input id="loginWorkerId" autocomplete="username" required></label>
+      <label>4-digit PIN<input id="loginPin" type="password" inputmode="numeric" maxlength="4" autocomplete="current-password" required></label>
+      <button class="btn btn-capture" type="submit">Sign In</button>
+    </form>
+    <form class="auth-form" id="registerForm" onsubmit="registerWorker(event)" style="display:none;">
+      <label>Full Name<input id="registerName" maxlength="60" required></label>
+      <label>Create Worker ID<input id="registerWorkerId" maxlength="24" placeholder="Example: W001" required></label>
+      <label>Create 4-digit PIN<input id="registerPin" type="password" inputmode="numeric" maxlength="4" required></label>
+      <label>Shift<select id="registerShift" required>
+        <option>General Shift</option><option>A Shift</option><option>B Shift</option><option>C Shift</option>
+      </select></label>
+      <label>Work Location<select id="registerYard" required>
+        <option>HSM Yard</option><option>CSP Yard</option>
+      </select></label>
+      <button class="btn btn-capture" type="submit">Create Account</button>
+    </form>
+    <div class="auth-error" id="authError"></div>
+  </div>
+</div>
+
 <div class="header">
   <h1>JSW COIL-ID SCANNER</h1>
   <div class="mode" id="modeLabel">Checking...</div>
 </div>
 
 <div class="container">
+
+  <div class="worker-bar" id="workerBar">
+    <div class="worker-top">
+      <div>
+        <div class="worker-name" id="workerName"></div>
+        <div class="worker-meta" id="workerMeta"></div>
+      </div>
+      <div class="worker-actions">
+        <button class="btn-small" onclick="toggleContext()">Change</button>
+        <button class="btn-small" onclick="logoutWorker()">Logout</button>
+      </div>
+    </div>
+    <div class="context-panel" id="contextPanel">
+      <select class="context-select" id="contextShift">
+        <option>General Shift</option><option>A Shift</option><option>B Shift</option><option>C Shift</option>
+      </select>
+      <select class="context-select" id="contextYard">
+        <option>HSM Yard</option><option>CSP Yard</option>
+      </select>
+      <button class="btn-small" onclick="saveContext()">Save Shift and Location</button>
+    </div>
+  </div>
 
   <!-- Camera -->
   <div class="camera-section">
@@ -660,6 +892,118 @@ let video         = document.getElementById('video');
 let canvas        = document.getElementById('canvas');
 let currentResult = null;
 let currentImagePath = '';
+let sessionToken = localStorage.getItem('jsw_worker_session') || '';
+let currentWorker = null;
+let cameraStarted = false;
+
+function showAuthMode(mode) {
+    const login = mode === 'login';
+    document.getElementById('loginForm').style.display = login ? 'grid' : 'none';
+    document.getElementById('registerForm').style.display = login ? 'none' : 'grid';
+    document.getElementById('loginTab').classList.toggle('active', login);
+    document.getElementById('registerTab').classList.toggle('active', !login);
+    document.getElementById('authError').textContent = '';
+}
+
+async function postForm(url, values) {
+    const form = new FormData();
+    Object.entries(values).forEach(([key, value]) => form.append(key, value));
+    const response = await fetch(url, {method:'POST', body:form});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Request failed');
+    return data;
+}
+
+function applyWorker(worker, token) {
+    currentWorker = worker;
+    if (token) {
+        sessionToken = token;
+        localStorage.setItem('jsw_worker_session', token);
+    }
+    document.getElementById('authScreen').style.display = 'none';
+    document.getElementById('workerBar').style.display = 'block';
+    document.getElementById('workerName').textContent =
+        worker.full_name + ' (' + worker.worker_id + ')';
+    document.getElementById('workerMeta').textContent =
+        worker.shift + ' | ' + worker.yard;
+    document.getElementById('contextShift').value = worker.shift;
+    document.getElementById('contextYard').value = worker.yard;
+    if (!cameraStarted) {
+        cameraStarted = true;
+        startCamera();
+    }
+    loadHistory();
+}
+
+async function restoreSession() {
+    if (!sessionToken) return;
+    try {
+        const data = await postForm('/worker/session', {session_token:sessionToken});
+        applyWorker(data.worker);
+    } catch(e) {
+        localStorage.removeItem('jsw_worker_session');
+        sessionToken = '';
+    }
+}
+
+async function loginWorker(event) {
+    event.preventDefault();
+    try {
+        const data = await postForm('/worker/login', {
+            worker_id: document.getElementById('loginWorkerId').value,
+            pin: document.getElementById('loginPin').value
+        });
+        applyWorker(data.worker, data.token);
+    } catch(e) {
+        document.getElementById('authError').textContent = e.message;
+    }
+}
+
+async function registerWorker(event) {
+    event.preventDefault();
+    try {
+        const data = await postForm('/worker/register', {
+            full_name: document.getElementById('registerName').value,
+            worker_id: document.getElementById('registerWorkerId').value,
+            pin: document.getElementById('registerPin').value,
+            shift: document.getElementById('registerShift').value,
+            yard: document.getElementById('registerYard').value
+        });
+        applyWorker(data.worker, data.token);
+    } catch(e) {
+        document.getElementById('authError').textContent = e.message;
+    }
+}
+
+function logoutWorker() {
+    sessionToken = '';
+    currentWorker = null;
+    localStorage.removeItem('jsw_worker_session');
+    document.getElementById('authScreen').style.display = 'block';
+    document.getElementById('workerBar').style.display = 'none';
+    document.getElementById('resultCard').style.display = 'none';
+    showAuthMode('login');
+}
+
+function toggleContext() {
+    const panel = document.getElementById('contextPanel');
+    panel.style.display = panel.style.display === 'grid' ? 'none' : 'grid';
+}
+
+async function saveContext() {
+    try {
+        const data = await postForm('/worker/context', {
+            session_token: sessionToken,
+            shift: document.getElementById('contextShift').value,
+            yard: document.getElementById('contextYard').value
+        });
+        applyWorker(data.worker);
+        document.getElementById('contextPanel').style.display = 'none';
+        retake();
+    } catch(e) {
+        alert(e.message);
+    }
+}
 
 // ── Camera init ──────────────────────────────────────────────────────────────
 async function startCamera() {
@@ -714,6 +1058,10 @@ function compressImage(blob) {
 
 // ── Capture from camera ───────────────────────────────────────────────────────
 function capture() {
+    if (!currentWorker) {
+        document.getElementById('authScreen').style.display = 'block';
+        return;
+    }
     canvas.width  = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext('2d').drawImage(video, 0, 0);
@@ -747,6 +1095,7 @@ async function sendImage(blob, attempt) {
 
     const form = new FormData();
     form.append('file', compressed, 'capture.jpg');
+    form.append('session_token', sessionToken);
 
     // Abort controller for timeout
     const ctrl    = new AbortController();
@@ -756,6 +1105,10 @@ async function sendImage(blob, attempt) {
         const r = await fetch('/predict', { method: 'POST', body: form, signal: ctrl.signal });
         clearTimeout(timeout);
         const result = await r.json();
+        if (!r.ok) {
+            if (r.status === 401) logoutWorker();
+            throw new Error(result.detail || 'Scan failed');
+        }
         currentResult    = result;
         currentImagePath = result.image_saved || '';
         showResult(result);
@@ -862,6 +1215,18 @@ function showResult(r) {
         confirmBtn.disabled  = true;
 
     // ── Image unclear → retake ────────────────────────────────────────────────
+    } else if (status === 'yard_mismatch') {
+        icon.className = 'status-icon status-warn';
+        icon.innerHTML = '&#x26A0;';
+        document.getElementById('statusText').textContent = 'Wrong Yard Format';
+        document.getElementById('statusDetail').textContent =
+            'The AI read does not match ' + (currentWorker ? currentWorker.yard : 'the selected yard');
+        idBox.textContent = r.coil_id || 'CHECK ID';
+        idBox.className = 'result-id warning';
+        warnings.innerHTML = '<div class="warning-box">Check the selected work location or type the correct coil ID.</div>';
+        manual.style.display = 'block';
+        confirmBtn.disabled = true;
+
     } else if (status === 'image_unclear' || status === 'image_rejected') {
         icon.className = 'status-icon status-error';
         icon.innerHTML = '&#x2716;';
@@ -914,12 +1279,13 @@ function validateManual() {
     input.value = val;
     const detected = (currentResult && currentResult.coil_id && currentResult.coil_id.length === 10)
                      ? currentResult.coil_id : null;
-    if (val.length === 10) {
+    const yardValid = val.length === 10 && matchesCurrentYard(val);
+    if (yardValid) {
         // worker typed a full override → use it
         document.getElementById('confirmBtn').disabled  = false;
         document.getElementById('resultId').textContent = val;
         document.getElementById('resultId').className   = 'result-id warning';
-    } else if (val.length === 0 && detected) {
+    } else if (val.length === 0 && detected && matchesCurrentYard(detected)) {
         // override cleared → fall back to confirming the AI-detected ID
         document.getElementById('confirmBtn').disabled  = false;
         document.getElementById('resultId').textContent = detected;
@@ -927,6 +1293,13 @@ function validateManual() {
         // partial typing → not a valid 10-digit ID yet
         document.getElementById('confirmBtn').disabled = true;
     }
+}
+
+function matchesCurrentYard(coilId) {
+    if (!currentWorker || !/^\d{10}$/.test(coilId)) return false;
+    const year = String(new Date().getFullYear()).slice(-2);
+    if (currentWorker.yard === 'HSM Yard') return coilId.startsWith('02' + year);
+    return coilId.startsWith(year) && coilId[3] === '0';
 }
 
 // ── Confirm ID ───────────────────────────────────────────────────────────────
@@ -938,6 +1311,10 @@ async function confirmId() {
 
     if (!coilId || coilId.length !== 10) {
         alert('No valid 10-digit coil ID to confirm');
+        return;
+    }
+    if (!matchesCurrentYard(coilId)) {
+        alert('This coil ID does not match ' + currentWorker.yard + ' for the current year.');
         return;
     }
 
@@ -954,9 +1331,14 @@ async function confirmId() {
         form.append('coil_id',         coilId);
         form.append('image_path',      currentImagePath);
         form.append('worker_verified', manualVal ? 'true' : 'false');
+        form.append('session_token',   sessionToken);
 
         const r = await fetch('/confirm', { method: 'POST', body: form });
         const d = await r.json();
+        if (!r.ok) {
+            if (r.status === 401) logoutWorker();
+            throw new Error(d.detail || 'Confirmation failed');
+        }
 
         if (d.is_duplicate) {
             alert('Warning: This coil ID was already scanned ' + d.total_scans + ' time(s)!');
@@ -1097,7 +1479,12 @@ function retake() {
 // ── History ───────────────────────────────────────────────────────────────────
 async function loadHistory() {
     try {
-        const r    = await fetch('/history');
+        if (!sessionToken) return;
+        const r    = await fetch('/history?session_token=' + encodeURIComponent(sessionToken));
+        if (r.status === 401) {
+            logoutWorker();
+            return;
+        }
         const d    = await r.json();
         const list = document.getElementById('historyList');
         list.innerHTML = '';
@@ -1109,7 +1496,9 @@ async function loadHistory() {
             const div  = document.createElement('div');
             div.className = 'history-item';
             const time = new Date(s.timestamp).toLocaleString();
-            div.innerHTML = '<span class="history-id">' + s.coil_id + '</span>'
+            div.innerHTML = '<span><span class="history-id">' + s.coil_id + '</span>'
+                          + '<span class="history-time" style="display:block;">'
+                          + s.shift + ' | ' + s.yard + '</span></span>'
                           + '<span class="history-time">' + time + '</span>';
             list.appendChild(div);
         });
@@ -1117,9 +1506,19 @@ async function loadHistory() {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-startCamera();
+// PWA install support
+function registerServiceWorker() {
+    if (!('serviceWorker' in navigator) || window.location.protocol !== 'https:') {
+        return;
+    }
+    navigator.serviceWorker.register('/sw.js').catch(e => {
+        console.log('Service worker registration failed:', e);
+    });
+}
+
+registerServiceWorker();
 checkMode();
-loadHistory();
+restoreSession();
 setInterval(loadHistory, HISTORY_REFRESH);  // auto-refresh every 30s
 </script>
 </body>
