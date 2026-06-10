@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from pipeline.gemini_pipeline import predict, register_coil
 from modules.inventory import InventoryManager
@@ -73,6 +73,18 @@ def _coil_matches_yard(coil_id: str, yard: str) -> bool:
     if yard == "HSM Yard":
         return coil_id.startswith(f"02{year}")
     return coil_id.startswith(year) and coil_id[3] == "0"
+
+
+def _require_manager(pin: str):
+    if pin != os.environ.get("MANAGER_PIN", "1234").strip():
+        raise HTTPException(401, "Manager PIN required")
+
+
+def _scan_image_url(image_path: str) -> str:
+    if not image_path:
+        return ""
+    name = Path(image_path).name
+    return f"/scan_image/{name}" if name else ""
 
 # ── Image save settings ──────────────────────────────────────────────────────
 # Save compressed image (not full 4MB raw). Same compression as Gemini gets.
@@ -636,6 +648,7 @@ def history_endpoint(session_token: str):
                         "coil_id":         coil_id,
                         "timestamp":       scan["timestamp"],
                         "image_path":      scan.get("image_path", ""),
+                        "image_url":       _scan_image_url(scan.get("image_path", "")),
                         "worker_verified": scan.get("worker_verified", False),
                         "worker_id":       scan.get("worker_id", ""),
                         "worker_name":     scan.get("worker_name", ""),
@@ -650,6 +663,103 @@ def history_endpoint(session_token: str):
 
 
 # ── Inventory endpoint ────────────────────────────────────────────────────────
+@app.get("/scan_image/{filename}")
+def scan_image(filename: str):
+    safe_name = Path(filename).name
+    path = UPLOAD_DIR / safe_name
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "Photo not found on server")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/manager_scans")
+def manager_scans(pin: str):
+    _require_manager(pin)
+    inv = InventoryManager()
+    scans = []
+    for coil_id, data in inv.get_all().items():
+        for scan in data.get("scans", []):
+            image_url = _scan_image_url(scan.get("image_path", ""))
+            image_exists = bool(image_url and (UPLOAD_DIR / Path(image_url).name).exists())
+            scans.append({
+                "coil_id": coil_id,
+                "timestamp": scan.get("timestamp", ""),
+                "image_url": image_url if image_exists else "",
+                "image_exists": image_exists,
+                "worker_verified": scan.get("worker_verified", False),
+                "worker_id": scan.get("worker_id", ""),
+                "worker_name": scan.get("worker_name", ""),
+                "shift": scan.get("shift", ""),
+                "yard": scan.get("yard", ""),
+            })
+    scans.sort(key=lambda x: x["timestamp"], reverse=True)
+    return {"scans": scans[:300], "total": len(scans)}
+
+
+@app.get("/manager", response_class=HTMLResponse)
+def manager_page():
+    return r"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSW Scan Review</title>
+<style>
+body{margin:0;background:#0f172a;color:#e2e8f0;font-family:Arial,sans-serif}
+.top{position:sticky;top:0;background:#1e293b;border-bottom:2px solid #3b82f6;padding:14px 16px;z-index:1}
+h1{font-size:20px;margin:0 0 10px;color:#60a5fa}.bar{display:flex;gap:8px}
+input{flex:1;background:#111827;color:#fff;border:1px solid #475569;border-radius:6px;padding:12px;font-size:16px}
+button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:12px 16px;font-weight:700}
+.wrap{padding:14px;max-width:900px;margin:auto}.msg{color:#94a3b8;margin:16px 2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.card{background:#1e293b;border:1px solid #334155;border-radius:8px;overflow:hidden}
+.card img{width:100%;height:210px;object-fit:cover;background:#020617;display:block}
+.meta{padding:10px}.coil{font:700 22px monospace;color:#4ade80;letter-spacing:1px}
+.line{font-size:13px;color:#cbd5e1;margin-top:4px}.missing{height:210px;display:flex;align-items:center;justify-content:center;color:#fca5a5;background:#111827}
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>JSW Scan Review</h1>
+  <div class="bar"><input id="pin" type="password" inputmode="numeric" placeholder="Manager PIN"><button onclick="loadScans()">Open</button></div>
+</div>
+<div class="wrap"><div class="msg" id="msg">Enter manager PIN to view confirmed scan photos.</div><div class="grid" id="grid"></div></div>
+<script>
+const saved = localStorage.getItem('jsw_manager_pin') || '';
+document.getElementById('pin').value = saved;
+async function loadScans(){
+  const pin = document.getElementById('pin').value.trim();
+  localStorage.setItem('jsw_manager_pin', pin);
+  const msg = document.getElementById('msg');
+  const grid = document.getElementById('grid');
+  msg.textContent = 'Loading scans...';
+  grid.innerHTML = '';
+  try {
+    const r = await fetch('/manager_scans?pin=' + encodeURIComponent(pin));
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Could not load scans');
+    msg.textContent = d.total ? `${d.total} scans found` : 'No confirmed scans found yet';
+    d.scans.forEach(s => {
+      const card = document.createElement('div');
+      card.className = 'card';
+      const photo = s.image_url ? `<a href="${s.image_url}" target="_blank"><img src="${s.image_url}"></a>` : '<div class="missing">Photo not on server</div>';
+      card.innerHTML = photo + `<div class="meta"><div class="coil">${s.coil_id}</div>
+        <div class="line">${s.worker_name || '-'} (${s.worker_id || '-'})</div>
+        <div class="line">${s.shift || '-'} | ${s.yard || '-'}</div>
+        <div class="line">${new Date(s.timestamp).toLocaleString()}</div>
+        <div class="line">${s.worker_verified ? 'Manual correction' : 'AI confirmed'}</div></div>`;
+      grid.appendChild(card);
+    });
+  } catch(e) {
+    msg.textContent = e.message;
+  }
+}
+if (saved) loadScans();
+</script>
+</body>
+</html>"""
+
+
 @app.get("/inventory")
 def inventory_endpoint():
     inv = InventoryManager()
