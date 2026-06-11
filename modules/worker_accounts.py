@@ -35,6 +35,10 @@ def _validate_pin(pin: str):
         raise ValueError("PIN must be exactly 4 digits")
 
 
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 class WorkerAccountManager:
     def __init__(self, path: Optional[str] = None):
         self.path = Path(path) if path else ACCOUNTS_PATH
@@ -65,6 +69,29 @@ class WorkerAccountManager:
             "yard": worker["yard"],
             "created_at": worker["created_at"],
         }
+
+    @staticmethod
+    def _add_session(worker: dict, token: str) -> None:
+        token_hash = _token_hash(token)
+        sessions = worker.get("session_hashes")
+        if not isinstance(sessions, list):
+            sessions = []
+            old_hash = worker.get("session_hash")
+            if old_hash:
+                sessions.append(old_hash)
+        sessions = [s for s in sessions if isinstance(s, str) and s != token_hash]
+        sessions.append(token_hash)
+        worker["session_hashes"] = sessions[-8:]
+        worker["session_hash"] = token_hash
+
+    @staticmethod
+    def _has_session(worker: dict, token_hash: str) -> bool:
+        sessions = worker.get("session_hashes")
+        if isinstance(sessions, list) and any(
+            hmac.compare_digest(str(session), token_hash) for session in sessions
+        ):
+            return True
+        return hmac.compare_digest(worker.get("session_hash", ""), token_hash)
 
     @staticmethod
     def _validate_profile(
@@ -109,11 +136,13 @@ class WorkerAccountManager:
                 "full_name": clean_name,
                 "pin_salt": salt,
                 "pin_hash": _pin_hash(pin, salt),
-                "session_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                "session_hash": "",
+                "session_hashes": [],
                 "shift": shift,
                 "yard": yard,
                 "created_at": datetime.now().isoformat(),
             }
+            self._add_session(worker, token)
             data["workers"][clean_id] = worker
             self._save(data)
         return {"token": token, "worker": self._public(worker)}
@@ -129,28 +158,28 @@ class WorkerAccountManager:
             if not hmac.compare_digest(candidate, worker["pin_hash"]):
                 raise ValueError("Worker ID or PIN is incorrect")
             token = secrets.token_urlsafe(32)
-            worker["session_hash"] = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            self._add_session(worker, token)
             self._save(data)
         return {"token": token, "worker": self._public(worker)}
 
     def authenticate(self, token: str) -> Optional[dict]:
         if not token:
             return None
-        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        token_hash = _token_hash(token)
         data = self._load()
         for worker in data["workers"].values():
-            if hmac.compare_digest(worker.get("session_hash", ""), token_hash):
+            if self._has_session(worker, token_hash):
                 return self._public(worker)
         return None
 
     def update_context(self, token: str, shift: str, yard: str) -> dict:
         if shift not in VALID_SHIFTS or yard not in VALID_YARDS:
             raise ValueError("Select a valid shift and work location")
-        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        token_hash = _token_hash(token)
         with _lock:
             data = self._load()
             for worker in data["workers"].values():
-                if hmac.compare_digest(worker.get("session_hash", ""), token_hash):
+                if self._has_session(worker, token_hash):
                     worker["shift"] = shift
                     worker["yard"] = yard
                     self._save(data)
@@ -161,11 +190,11 @@ class WorkerAccountManager:
         clean_name = " ".join(full_name.strip().split())
         if len(clean_name) < 2 or len(clean_name) > 60:
             raise ValueError("Enter a valid full name")
-        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        token_hash = _token_hash(token)
         with _lock:
             data = self._load()
             for worker in data["workers"].values():
-                if hmac.compare_digest(worker.get("session_hash", ""), token_hash):
+                if self._has_session(worker, token_hash):
                     worker["full_name"] = clean_name
                     self._save(data)
                     return self._public(worker)
@@ -174,11 +203,11 @@ class WorkerAccountManager:
     def change_pin(self, token: str, old_pin: str, new_pin: str) -> dict:
         _validate_pin(old_pin)
         _validate_pin(new_pin)
-        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        token_hash = _token_hash(token)
         with _lock:
             data = self._load()
             for worker in data["workers"].values():
-                if hmac.compare_digest(worker.get("session_hash", ""), token_hash):
+                if self._has_session(worker, token_hash):
                     old_hash = _pin_hash(old_pin, worker["pin_salt"])
                     if not hmac.compare_digest(old_hash, worker["pin_hash"]):
                         raise ValueError("Old PIN is incorrect")

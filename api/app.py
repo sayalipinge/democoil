@@ -377,7 +377,7 @@ def manifest():
 def service_worker():
     """Tiny service worker so Android Chrome treats the site as installable."""
     js = r"""
-const CACHE_NAME = 'jsw-coil-scanner-v2';
+const CACHE_NAME = 'jsw-coil-scanner-v4';
 const APP_SHELL = ['/', '/manifest.json', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', event => {
@@ -579,6 +579,19 @@ def worker_change_pin(
         raise HTTPException(400, str(e))
 
 
+@app.post("/worker/forgot_pin")
+def worker_forgot_pin(
+    worker_id: str = Form(...),
+    manager_pin: str = Form(...),
+    new_pin: str = Form(...),
+):
+    _require_manager(manager_pin)
+    try:
+        return {"worker": worker_accounts.reset_pin(worker_id, new_pin)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.post("/predict")
 async def predict_endpoint(
     file: UploadFile = File(...),
@@ -660,27 +673,25 @@ def history_endpoint(session_token: str):
     worker = _require_worker(session_token)
     inv     = InventoryManager()
     all_c   = inv.get_all()
-    cutoff  = datetime.now() - timedelta(days=2)
     recent  = []
 
     for coil_id, data in all_c.items():
         for scan in data["scans"]:
             try:
-                scan_time = datetime.fromisoformat(scan["timestamp"])
-                if scan_time >= cutoff:
-                    if scan.get("worker_id") != worker["worker_id"]:
-                        continue
-                    recent.append({
-                        "coil_id":         coil_id,
-                        "timestamp":       scan["timestamp"],
-                        "image_path":      scan.get("image_path", ""),
-                        "image_url":       _scan_image_url(scan.get("image_path", "")),
-                        "worker_verified": scan.get("worker_verified", False),
-                        "worker_id":       scan.get("worker_id", ""),
-                        "worker_name":     scan.get("worker_name", ""),
-                        "shift":           scan.get("shift", ""),
-                        "yard":            scan.get("yard", ""),
-                    })
+                datetime.fromisoformat(scan["timestamp"])
+                if scan.get("worker_id") != worker["worker_id"]:
+                    continue
+                recent.append({
+                    "coil_id":         coil_id,
+                    "timestamp":       scan["timestamp"],
+                    "image_path":      scan.get("image_path", ""),
+                    "image_url":       _scan_image_url(scan.get("image_path", "")),
+                    "worker_verified": scan.get("worker_verified", False),
+                    "worker_id":       scan.get("worker_id", ""),
+                    "worker_name":     scan.get("worker_name", ""),
+                    "shift":           scan.get("shift", ""),
+                    "yard":            scan.get("yard", ""),
+                })
             except (ValueError, KeyError):
                 pass
 
@@ -861,7 +872,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 .auth-box { max-width: 420px; margin: 0 auto; }
 .auth-title { color: #3b82f6; font-size: 24px; text-align: center; margin-bottom: 6px; }
 .auth-subtitle { color: #94a3b8; text-align: center; margin-bottom: 22px; font-size: 14px; }
-.auth-tabs { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid #334155; margin-bottom: 18px; }
+.auth-tabs { display: grid; grid-template-columns: 1fr 1fr 1fr; border-bottom: 1px solid #334155; margin-bottom: 18px; }
 .auth-tab { border: 0; background: transparent; color: #94a3b8; padding: 12px; font-size: 15px; font-weight: 700; }
 .auth-tab.active { color: #60a5fa; border-bottom: 3px solid #3b82f6; }
 .auth-form { display: grid; gap: 12px; }
@@ -949,6 +960,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
     <div class="auth-tabs">
       <button class="auth-tab active" id="loginTab" onclick="showAuthMode('login')">Sign In</button>
       <button class="auth-tab" id="registerTab" onclick="showAuthMode('register')">Create Account</button>
+      <button class="auth-tab" id="forgotTab" onclick="showAuthMode('forgot')">Forgot PIN</button>
     </div>
     <form class="auth-form" id="loginForm" onsubmit="loginWorker(event)">
       <label>Worker ID<input id="loginWorkerId" autocomplete="username" required></label>
@@ -966,6 +978,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
         <option>HSM Yard</option><option>CSP Yard</option>
       </select></label>
       <button class="btn btn-capture" type="submit">Create Account</button>
+    </form>
+    <form class="auth-form" id="forgotForm" onsubmit="forgotPin(event)" style="display:none;">
+      <label>Worker ID<input id="forgotWorkerId" maxlength="24" placeholder="Example: W001" required></label>
+      <label>Manager PIN<input id="forgotManagerPin" type="password" inputmode="numeric" maxlength="8" required></label>
+      <label>New 4-digit PIN<input id="forgotNewPin" type="password" inputmode="numeric" maxlength="4" required></label>
+      <button class="btn btn-capture" type="submit">Reset PIN</button>
     </form>
     <div class="auth-error" id="authError"></div>
   </div>
@@ -1084,10 +1102,15 @@ let cameraStarted = false;
 
 function showAuthMode(mode) {
     const login = mode === 'login';
+    const register = mode === 'register';
+    const forgot = mode === 'forgot';
     document.getElementById('loginForm').style.display = login ? 'grid' : 'none';
-    document.getElementById('registerForm').style.display = login ? 'none' : 'grid';
+    document.getElementById('registerForm').style.display = register ? 'grid' : 'none';
+    document.getElementById('forgotForm').style.display = forgot ? 'grid' : 'none';
     document.getElementById('loginTab').classList.toggle('active', login);
-    document.getElementById('registerTab').classList.toggle('active', !login);
+    document.getElementById('registerTab').classList.toggle('active', register);
+    document.getElementById('forgotTab').classList.toggle('active', forgot);
+    document.getElementById('authError').style.color = '#fca5a5';
     document.getElementById('authError').textContent = '';
 }
 
@@ -1158,6 +1181,29 @@ async function registerWorker(event) {
         });
         applyWorker(data.worker, data.token);
     } catch(e) {
+        document.getElementById('authError').textContent = e.message;
+    }
+}
+
+async function forgotPin(event) {
+    event.preventDefault();
+    try {
+        await postForm('/worker/forgot_pin', {
+            worker_id: document.getElementById('forgotWorkerId').value,
+            manager_pin: document.getElementById('forgotManagerPin').value,
+            new_pin: document.getElementById('forgotNewPin').value
+        });
+        document.getElementById('authError').style.color = '#86efac';
+        document.getElementById('authError').textContent = 'PIN reset. Sign in with the new PIN.';
+        document.getElementById('loginWorkerId').value = document.getElementById('forgotWorkerId').value;
+        document.getElementById('loginPin').value = '';
+        document.getElementById('forgotManagerPin').value = '';
+        document.getElementById('forgotNewPin').value = '';
+        showAuthMode('login');
+        document.getElementById('authError').style.color = '#86efac';
+        document.getElementById('authError').textContent = 'PIN reset. Sign in with the new PIN.';
+    } catch(e) {
+        document.getElementById('authError').style.color = '#fca5a5';
         document.getElementById('authError').textContent = e.message;
     }
 }
@@ -1709,7 +1755,7 @@ async function loadHistory() {
         const list = document.getElementById('historyList');
         list.innerHTML = '';
         if (!d.scans.length) {
-            list.innerHTML = '<div style="color:#475569;font-size:13px;">No scans in last 2 days</div>';
+            list.innerHTML = '<div style="color:#475569;font-size:13px;">No scans saved for this worker</div>';
             return;
         }
         d.scans.slice(0, 20).forEach(s => {
