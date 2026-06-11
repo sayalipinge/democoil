@@ -30,6 +30,11 @@ def _pin_hash(pin: str, salt_hex: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, 150_000).hex()
 
 
+def _validate_pin(pin: str):
+    if not (len(pin) == 4 and pin.isdigit()):
+        raise ValueError("PIN must be exactly 4 digits")
+
+
 class WorkerAccountManager:
     def __init__(self, path: Optional[str] = None):
         self.path = Path(path) if path else ACCOUNTS_PATH
@@ -75,8 +80,7 @@ class WorkerAccountManager:
             raise ValueError("Worker ID must be 3-24 letters, numbers, dot, dash or underscore")
         if len(clean_name) < 2 or len(clean_name) > 60:
             raise ValueError("Enter a valid full name")
-        if not (len(pin) == 4 and pin.isdigit()):
-            raise ValueError("PIN must be exactly 4 digits")
+        _validate_pin(pin)
         if shift not in VALID_SHIFTS:
             raise ValueError("Select a valid shift")
         if yard not in VALID_YARDS:
@@ -152,6 +156,52 @@ class WorkerAccountManager:
                     self._save(data)
                     return self._public(worker)
         raise ValueError("Session expired. Log in again.")
+
+    def update_profile(self, token: str, full_name: str) -> dict:
+        clean_name = " ".join(full_name.strip().split())
+        if len(clean_name) < 2 or len(clean_name) > 60:
+            raise ValueError("Enter a valid full name")
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with _lock:
+            data = self._load()
+            for worker in data["workers"].values():
+                if hmac.compare_digest(worker.get("session_hash", ""), token_hash):
+                    worker["full_name"] = clean_name
+                    self._save(data)
+                    return self._public(worker)
+        raise ValueError("Session expired. Log in again.")
+
+    def change_pin(self, token: str, old_pin: str, new_pin: str) -> dict:
+        _validate_pin(old_pin)
+        _validate_pin(new_pin)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with _lock:
+            data = self._load()
+            for worker in data["workers"].values():
+                if hmac.compare_digest(worker.get("session_hash", ""), token_hash):
+                    old_hash = _pin_hash(old_pin, worker["pin_salt"])
+                    if not hmac.compare_digest(old_hash, worker["pin_hash"]):
+                        raise ValueError("Old PIN is incorrect")
+                    salt = secrets.token_hex(16)
+                    worker["pin_salt"] = salt
+                    worker["pin_hash"] = _pin_hash(new_pin, salt)
+                    self._save(data)
+                    return self._public(worker)
+        raise ValueError("Session expired. Log in again.")
+
+    def reset_pin(self, worker_id: str, new_pin: str) -> dict:
+        clean_id = worker_id.strip().upper()
+        _validate_pin(new_pin)
+        with _lock:
+            data = self._load()
+            worker = data["workers"].get(clean_id)
+            if not worker:
+                raise ValueError("Worker ID not found")
+            salt = secrets.token_hex(16)
+            worker["pin_salt"] = salt
+            worker["pin_hash"] = _pin_hash(new_pin, salt)
+            self._save(data)
+            return self._public(worker)
 
     def list_workers(self) -> list[dict]:
         data = self._load()

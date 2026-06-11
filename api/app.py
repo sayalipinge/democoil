@@ -76,7 +76,8 @@ def _coil_matches_yard(coil_id: str, yard: str) -> bool:
 
 
 def _require_manager(pin: str):
-    if pin != os.environ.get("MANAGER_PIN", "1234").strip():
+    expected = os.environ.get("MANAGER_PIN", "").strip() or "1234"
+    if pin != expected:
         raise HTTPException(401, "Manager PIN required")
 
 
@@ -553,6 +554,31 @@ def worker_context(
         raise HTTPException(400, str(e))
 
 
+@app.post("/worker/profile")
+def worker_profile(
+    session_token: str = Form(...),
+    full_name: str = Form(...),
+):
+    _require_worker(session_token)
+    try:
+        return {"worker": worker_accounts.update_profile(session_token, full_name)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/worker/change_pin")
+def worker_change_pin(
+    session_token: str = Form(...),
+    old_pin: str = Form(...),
+    new_pin: str = Form(...),
+):
+    _require_worker(session_token)
+    try:
+        return {"worker": worker_accounts.change_pin(session_token, old_pin, new_pin)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.post("/predict")
 async def predict_endpoint(
     file: UploadFile = File(...),
@@ -696,6 +722,19 @@ def manager_scans(pin: str):
     return {"scans": scans[:300], "total": len(scans)}
 
 
+@app.post("/manager/reset_worker_pin")
+def manager_reset_worker_pin(
+    pin: str = Form(...),
+    worker_id: str = Form(...),
+    new_pin: str = Form(...),
+):
+    _require_manager(pin)
+    try:
+        return {"worker": worker_accounts.reset_pin(worker_id, new_pin)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/manager", response_class=HTMLResponse)
 def manager_page():
     return r"""<!doctype html>
@@ -723,7 +762,15 @@ button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:12px 16p
   <h1>JSW Scan Review</h1>
   <div class="bar"><input id="pin" type="password" inputmode="numeric" placeholder="Manager PIN"><button onclick="loadScans()">Open</button></div>
 </div>
-<div class="wrap"><div class="msg" id="msg">Enter manager PIN to view confirmed scan photos.</div><div class="grid" id="grid"></div></div>
+<div class="wrap">
+  <div class="msg" id="msg">Enter manager PIN to view confirmed scan photos.</div>
+  <div class="card" style="padding:12px;margin-bottom:12px;">
+    <div class="line" style="font-weight:700;color:#e2e8f0;margin-bottom:8px;">Reset worker PIN</div>
+    <div class="bar"><input id="resetWorkerId" placeholder="Worker ID"><input id="resetPin" inputmode="numeric" maxlength="4" placeholder="New PIN"><button onclick="resetWorkerPin()">Reset</button></div>
+    <div class="line" id="resetMsg"></div>
+  </div>
+  <div class="grid" id="grid"></div>
+</div>
 <script>
 const saved = localStorage.getItem('jsw_manager_pin') || '';
 document.getElementById('pin').value = saved;
@@ -752,6 +799,25 @@ async function loadScans(){
     });
   } catch(e) {
     msg.textContent = e.message;
+  }
+}
+async function resetWorkerPin(){
+  const pin = document.getElementById('pin').value.trim();
+  const workerId = document.getElementById('resetWorkerId').value.trim();
+  const newPin = document.getElementById('resetPin').value.trim();
+  const resetMsg = document.getElementById('resetMsg');
+  resetMsg.textContent = 'Resetting...';
+  const form = new FormData();
+  form.append('pin', pin);
+  form.append('worker_id', workerId);
+  form.append('new_pin', newPin);
+  try {
+    const r = await fetch('/manager/reset_worker_pin', {method:'POST', body:form});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Reset failed');
+    resetMsg.textContent = 'PIN reset for ' + d.worker.worker_id;
+  } catch(e) {
+    resetMsg.textContent = e.message;
   }
 }
 if (saved) loadScans();
@@ -810,6 +876,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
 .btn-small { padding: 8px 10px; font-size: 13px; border-radius: 6px; border: 1px solid #475569; background: transparent; color: #cbd5e1; }
 .context-panel { display: none; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
 .context-panel .btn-small { grid-column: 1 / -1; background: #2563eb; color: white; border: 0; }
+.settings-panel { display: none; gap: 8px; margin-top: 12px; }
+.settings-panel input { width: 100%; border: 1px solid #475569; background: #111827; color: #f8fafc; border-radius: 6px; padding: 12px; font-size: 15px; }
 
 /* Camera */
 .camera-section { text-align: center; margin-bottom: 16px; }
@@ -918,6 +986,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
       </div>
       <div class="worker-actions">
         <button class="btn-small" onclick="toggleContext()">Change</button>
+        <button class="btn-small" onclick="toggleSettings()">Account</button>
         <button class="btn-small" onclick="logoutWorker()">Logout</button>
       </div>
     </div>
@@ -929,6 +998,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #
         <option>HSM Yard</option><option>CSP Yard</option>
       </select>
       <button class="btn-small" onclick="saveContext()">Save Shift and Location</button>
+    </div>
+    <div class="settings-panel" id="settingsPanel">
+      <input id="profileName" placeholder="Full name">
+      <button class="btn-small" onclick="saveProfile()">Save Name</button>
+      <input id="oldPin" type="password" inputmode="numeric" maxlength="4" placeholder="Old PIN">
+      <input id="newPin" type="password" inputmode="numeric" maxlength="4" placeholder="New PIN">
+      <button class="btn-small" onclick="changePin()">Change PIN</button>
     </div>
   </div>
 
@@ -1038,6 +1114,7 @@ function applyWorker(worker, token) {
         worker.shift + ' | ' + worker.yard;
     document.getElementById('contextShift').value = worker.shift;
     document.getElementById('contextYard').value = worker.yard;
+    document.getElementById('profileName').value = worker.full_name;
     if (!cameraStarted) {
         cameraStarted = true;
         startCamera();
@@ -1100,6 +1177,11 @@ function toggleContext() {
     panel.style.display = panel.style.display === 'grid' ? 'none' : 'grid';
 }
 
+function toggleSettings() {
+    const panel = document.getElementById('settingsPanel');
+    panel.style.display = panel.style.display === 'grid' ? 'none' : 'grid';
+}
+
 async function saveContext() {
     try {
         const data = await postForm('/worker/context', {
@@ -1110,6 +1192,34 @@ async function saveContext() {
         applyWorker(data.worker);
         document.getElementById('contextPanel').style.display = 'none';
         retake();
+    } catch(e) {
+        alert(e.message);
+    }
+}
+
+async function saveProfile() {
+    try {
+        const data = await postForm('/worker/profile', {
+            session_token: sessionToken,
+            full_name: document.getElementById('profileName').value
+        });
+        applyWorker(data.worker);
+        alert('Name updated');
+    } catch(e) {
+        alert(e.message);
+    }
+}
+
+async function changePin() {
+    try {
+        await postForm('/worker/change_pin', {
+            session_token: sessionToken,
+            old_pin: document.getElementById('oldPin').value,
+            new_pin: document.getElementById('newPin').value
+        });
+        document.getElementById('oldPin').value = '';
+        document.getElementById('newPin').value = '';
+        alert('PIN changed');
     } catch(e) {
         alert(e.message);
     }
